@@ -23,14 +23,17 @@ function freshData() {
     draftOpen: false,
     lastSeasonStandings: [],
     worldsTeams: [],
-    seasonTeams: []
+    seasonTeams: [],
+    pendingTrade: null
   };
 }
 
 function loadData(guildId) {
   try {
-    return JSON.parse(fs.readFileSync(`./data_${guildId}.json`));
-  } catch (err) {
+    const d = JSON.parse(fs.readFileSync(`./data_${guildId}.json`));
+    if (!d.pendingTrade) d.pendingTrade = null;
+    return d;
+  } catch {
     return freshData();
   }
 }
@@ -39,106 +42,93 @@ function saveData(data, guildId) {
   fs.writeFileSync(`./data_${guildId}.json`, JSON.stringify(data, null, 2));
 }
 
-// ---------------- SAFE FETCH ----------------
+// ---------------- TBA CACHE ----------------
+const teamNameCache = new Map();
+let seasonTeamsCache = null;
+
 async function safeFetch(url, options = {}) {
   try {
     const res = await fetch(url, options);
     if (res.status === 404) return null;
     if (!res.ok) return null;
     return await res.json();
-  } catch (err) {
+  } catch {
     console.error(`Fetch error: ${url}`);
     return null;
   }
 }
 
-// ---------------- TBA HELPERS ----------------
+const TBA = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
+
 async function getTeamName(teamNumber) {
+  if (teamNameCache.has(teamNumber)) return teamNameCache.get(teamNumber);
   try {
     const res = await fetch(
       `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}`,
-      { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } }
+      TBA
     );
-    if (!res.ok) return `Team ${teamNumber}`;
+    if (!res.ok) { teamNameCache.set(teamNumber, `Team ${teamNumber}`); return `Team ${teamNumber}`; }
     const data = await res.json();
-    return `${data.nickname || 'Unknown'} (FRC ${teamNumber})`;
-  } catch (err) {
+    const name = `${data.nickname || 'Unknown'} (FRC ${teamNumber})`;
+    teamNameCache.set(teamNumber, name);
+    return name;
+  } catch {
     return `Team ${teamNumber}`;
   }
 }
 
 async function loadSeasonTeams() {
+  if (seasonTeamsCache) return seasonTeamsCache;
   const allTeams = [];
   let page = 0;
   while (true) {
-    const teams = await safeFetch(
-      `https://www.thebluealliance.com/api/v3/teams/2026/${page}`,
-      { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } }
-    );
+    const teams = await safeFetch(`https://www.thebluealliance.com/api/v3/teams/2026/${page}`, TBA);
     if (!teams || teams.length === 0) break;
     allTeams.push(...teams.map(t => t.team_number));
     page++;
   }
+  seasonTeamsCache = allTeams;
   return allTeams;
 }
 
 async function loadWorldsTeams() {
-  const teams = await safeFetch(
-    'https://www.thebluealliance.com/api/v3/event/2026cmptx/teams',
-    { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } }
-  );
+  const teams = await safeFetch('https://www.thebluealliance.com/api/v3/event/2026cmptx/teams', TBA);
   return teams?.map(t => t.team_number) || [];
 }
 
 // ---------------- SCORING ----------------
 async function getTeamSeasonScore(teamNumber) {
-  const tbaHeaders = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
   const events = await safeFetch(
-    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`,
-    tbaHeaders
+    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA
   );
-  if (!events || events.length === 0) return 0;
+  if (!events?.length) return 0;
 
   const regularEvents = events
     .filter(e => e.event_type === 0 || e.event_type === 1)
     .sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
     .slice(0, 2);
 
-  if (regularEvents.length === 0) return 0;
+  if (!regularEvents.length) return 0;
 
-  let total = 0;
-  let counted = 0;
+  let total = 0, counted = 0;
   for (const ev of regularEvents) {
-    const dp = await safeFetch(
-      `https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`,
-      tbaHeaders
-    );
+    const dp = await safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`, TBA);
     const pts = dp?.points?.[`frc${teamNumber}`]?.total;
-    if (pts != null) {
-      total += pts;
-      counted++;
-    }
+    if (pts != null) { total += pts; counted++; }
   }
-
   if (counted === 1) total *= 2;
   return total;
 }
 
 async function getTeamWorldsScore(teamNumber) {
-  const tbaHeaders = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
   const events = await safeFetch(
-    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`,
-    tbaHeaders
+    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA
   );
-  if (!events || events.length === 0) return 0;
+  if (!events?.length) return 0;
 
-  const cmpEvents = events.filter(e => e.event_type === 3 || e.event_type === 4);
   let total = 0;
-  for (const ev of cmpEvents) {
-    const dp = await safeFetch(
-      `https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`,
-      tbaHeaders
-    );
+  for (const ev of events.filter(e => e.event_type === 3 || e.event_type === 4)) {
+    const dp = await safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`, TBA);
     const pts = dp?.points?.[`frc${teamNumber}`]?.total;
     if (pts != null) total += pts;
   }
@@ -146,17 +136,14 @@ async function getTeamWorldsScore(teamNumber) {
 }
 
 async function calcStandings(data, scoreFn) {
-  const playerScores = [];
-  for (const player of data.players) {
-    const teams = data.teamsDrafted[player] || [];
-    let totalScore = 0;
-    for (const team of teams) {
-      totalScore += await scoreFn(team);
-    }
-    playerScores.push({ player, totalScore });
-  }
-  playerScores.sort((a, b) => b.totalScore - a.totalScore);
-  return playerScores;
+  const results = await Promise.all(
+    data.players.map(async player => {
+      const teams = data.teamsDrafted[player] || [];
+      const scores = await Promise.all(teams.map(scoreFn));
+      return { player, totalScore: scores.reduce((a, b) => a + b, 0) };
+    })
+  );
+  return results.sort((a, b) => b.totalScore - a.totalScore);
 }
 
 // ---------------- DRAFT HELPERS ----------------
@@ -165,6 +152,13 @@ function getCurrentPlayer(data) {
   const round = Math.floor(data.currentPick / n);
   const index = data.currentPick % n;
   return (round % 2 === 0) ? data.draftOrder[index] : data.draftOrder[n - 1 - index];
+}
+
+function findOwner(data, team) {
+  for (const [player, teams] of Object.entries(data.teamsDrafted)) {
+    if (teams.includes(team)) return player;
+  }
+  return null;
 }
 
 // ---------------- GLOBAL ERROR SAFETY ----------------
@@ -191,12 +185,10 @@ client.on('interactionCreate', async (interaction) => {
     // ── DRAFT STATUS ──────────────────────────────────────────────
     if (interaction.commandName === 'draftstatus') {
       const setToOpen = interaction.options.getBoolean('open');
-
       if (data.players.length > 0 && userId !== data.players[0]) {
         return interaction.reply("❌ Only the draft host can change draft status.");
       }
-
-      if (setToOpen === true) {
+      if (setToOpen) {
         data.draftOpen = true;
         saveData(data, guildId);
         return interaction.reply("✅ **Draft is now OPEN**\nPlayers can now join using `/join_draft`");
@@ -208,22 +200,17 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── JOIN DRAFT ────────────────────────────────────────────────
     if (interaction.commandName === 'join_draft') {
-      if (!data.draftOpen) {
-        return interaction.reply("❌ Draft joining is currently closed.\nAsk the host to run `/draftstatus open:true`");
-      }
-      if (!data.players.includes(userId)) {
-        data.players.push(userId);
-        saveData(data, guildId);
-        return interaction.reply(`✅ <@${userId}> has joined the draft!`);
-      }
-      return interaction.reply("You are already in the draft.");
+      if (!data.draftOpen) return interaction.reply("❌ Draft joining is currently closed.\nAsk the host to run `/draftstatus open:true`");
+      if (data.players.includes(userId)) return interaction.reply("You are already in the draft.");
+      data.players.push(userId);
+      saveData(data, guildId);
+      return interaction.reply(`✅ <@${userId}> has joined the draft!`);
     }
 
     // ── START SEASON DRAFT ────────────────────────────────────────
     if (interaction.commandName === 'start_draft') {
       await interaction.deferReply();
-
-      if (data.players.length === 0) return interaction.editReply("❌ No players have joined yet.");
+      if (!data.players.length) return interaction.editReply("❌ No players have joined yet.");
       if (userId !== data.players[0]) return interaction.editReply("❌ Only the host can start the draft.");
 
       data.phase = "season";
@@ -232,42 +219,40 @@ client.on('interactionCreate', async (interaction) => {
       data.currentPick = 0;
       data.teamsDrafted = Object.fromEntries(data.players.map(p => [p, []]));
       data.draftOpen = false;
+      data.pendingTrade = null;
       saveData(data, guildId);
 
-      const first = getCurrentPlayer(data);
       return interaction.editReply(
-        `🚀 **Season Draft Started!**\nTeams loaded: ${data.seasonTeams.length}\nFirst pick: <@${first}>`
+        `🚀 **Season Draft Started!**\nTeams loaded: ${data.seasonTeams.length}\nFirst pick: <@${getCurrentPlayer(data)}>`
       );
     }
 
     // ── START WORLDS DRAFT ────────────────────────────────────────
     if (interaction.commandName === 'start_worlds_draft') {
       await interaction.deferReply();
-
-      if (data.players.length === 0) return interaction.editReply("❌ No players have joined yet.");
+      if (!data.players.length) return interaction.editReply("❌ No players have joined yet.");
       if (userId !== data.players[0]) return interaction.editReply("❌ Only the host can start the draft.");
 
-      await interaction.editReply("⏳ Calculating final season standings from TBA… this may take a moment.");
+      await interaction.editReply("⏳ Calculating final season standings from TBA…");
 
       const seasonStandings = await calcStandings(data, getTeamSeasonScore);
       data.lastSeasonStandings = seasonStandings.map(p => p.player);
-
       data.phase = "worlds";
       data.worldsTeams = await loadWorldsTeams();
       data.draftOrder = [...data.lastSeasonStandings].reverse();
       data.currentPick = 0;
       data.teamsDrafted = Object.fromEntries(data.players.map(p => [p, []]));
       data.draftOpen = false;
+      data.pendingTrade = null;
       saveData(data, guildId);
 
       const medals = ['🥇', '🥈', '🥉'];
       const standingsText = seasonStandings
         .map((p, i) => `${medals[i] || `${i + 1}.`} <@${p.player}> — **${p.totalScore} pts**`)
         .join('\n');
-      const draftOrderText = data.draftOrder.map(p => `<@${p}>`).join(' → ');
 
       return interaction.editReply(
-        `🌍 **Worlds Draft Started!**\n\n**Final Season Standings:**\n${standingsText}\n\n**Worlds Draft Order** (worst → best):\n${draftOrderText}\n\nFirst pick: <@${data.draftOrder[0]}>`
+        `🌍 **Worlds Draft Started!**\n\n**Final Season Standings:**\n${standingsText}\n\n**Draft Order** (worst → best):\n${data.draftOrder.map(p => `<@${p}>`).join(' → ')}\n\nFirst pick: <@${data.draftOrder[0]}>`
       );
     }
 
@@ -277,61 +262,111 @@ client.on('interactionCreate', async (interaction) => {
       const current = getCurrentPlayer(data);
 
       if (userId !== current) return interaction.reply({ content: "⛔ It's not your turn.", ephemeral: true });
-
       const pool = data.phase === "worlds" ? data.worldsTeams : data.seasonTeams;
       if (!pool.includes(team)) return interaction.reply({ content: `⛔ Team ${team} is not in the pool.`, ephemeral: true });
-
-      for (const picks of Object.values(data.teamsDrafted)) {
-        if (picks.includes(team)) return interaction.reply({ content: `⛔ Team ${team} has already been drafted.`, ephemeral: true });
-      }
+      if (findOwner(data, team)) return interaction.reply({ content: `⛔ Team ${team} has already been drafted.`, ephemeral: true });
 
       await interaction.deferReply();
-
       data.teamsDrafted[current].push(team);
       data.currentPick++;
 
-      const name = await getTeamName(team);
+      const [name] = await Promise.all([getTeamName(team)]);
       const maxPicks = data.players.length * 6;
 
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, guildId);
-        return interaction.editReply(`🏁 **Draft complete!**\n✅ <@${userId}> picked **${name}**\n\nRun \`/standings\` to see the final results!`);
+        return interaction.editReply(`🏁 **Draft complete!**\n✅ <@${userId}> picked **${name}**\n\nRun \`/standings\` to see the results!`);
       }
 
-      const next = getCurrentPlayer(data);
       saveData(data, guildId);
-      return interaction.editReply(`✅ <@${userId}> picked **${name}**\n\n👉 Next pick: <@${next}>`);
+      return interaction.editReply(`✅ <@${userId}> picked **${name}**\n\n👉 Next pick: <@${getCurrentPlayer(data)}>`);
+    }
+
+    // ── TRADE ─────────────────────────────────────────────────────
+    if (interaction.commandName === 'trade') {
+      const offering = interaction.options.getInteger('offer');
+      const wanting  = interaction.options.getInteger('request');
+
+      if (!data.players.includes(userId)) return interaction.reply({ content: "❌ You're not in this draft.", ephemeral: true });
+      if (offering === wanting) return interaction.reply({ content: "❌ You can't trade a team for itself.", ephemeral: true });
+
+      const myTeams = data.teamsDrafted[userId] || [];
+      if (!myTeams.includes(offering)) return interaction.reply({ content: `❌ You don't own FRC ${offering}.`, ephemeral: true });
+
+      const theirOwner = findOwner(data, wanting);
+      if (!theirOwner) return interaction.reply({ content: `❌ FRC ${wanting} hasn't been drafted yet.`, ephemeral: true });
+      if (theirOwner === userId) return interaction.reply({ content: "❌ You already own that team.", ephemeral: true });
+
+      if (data.pendingTrade) return interaction.reply({ content: "❌ There's already a pending trade. It must be accepted, declined, or cancelled first.", ephemeral: true });
+
+      data.pendingTrade = { from: userId, offering, wanting, to: theirOwner };
+      saveData(data, guildId);
+
+      const [offerName, wantName] = await Promise.all([getTeamName(offering), getTeamName(wanting)]);
+      const embed = new EmbedBuilder()
+        .setTitle("🔄 Trade Proposal")
+        .setDescription(
+          `<@${userId}> wants to trade with <@${theirOwner}>\n\n` +
+          `**Offering:** ${offerName}\n` +
+          `**Requesting:** ${wantName}\n\n` +
+          `<@${theirOwner}>: run \`/accepttrade\` to accept or \`/declinetrade\` to decline.`
+        )
+        .setColor(0xF0A500);
+
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    // ── ACCEPT TRADE ──────────────────────────────────────────────
+    if (interaction.commandName === 'accepttrade') {
+      const trade = data.pendingTrade;
+      if (!trade) return interaction.reply({ content: "❌ There's no pending trade.", ephemeral: true });
+      if (userId !== trade.to) return interaction.reply({ content: "❌ This trade isn't directed at you.", ephemeral: true });
+
+      // Swap teams
+      data.teamsDrafted[trade.from] = data.teamsDrafted[trade.from].filter(t => t !== trade.offering);
+      data.teamsDrafted[trade.to]   = data.teamsDrafted[trade.to].filter(t => t !== trade.wanting);
+      data.teamsDrafted[trade.from].push(trade.wanting);
+      data.teamsDrafted[trade.to].push(trade.offering);
+      data.pendingTrade = null;
+      saveData(data, guildId);
+
+      const [offerName, wantName] = await Promise.all([getTeamName(trade.offering), getTeamName(trade.wanting)]);
+      return interaction.reply(
+        `✅ **Trade accepted!**\n<@${trade.from}> receives **${wantName}**\n<@${trade.to}> receives **${offerName}**`
+      );
+    }
+
+    // ── DECLINE TRADE ─────────────────────────────────────────────
+    if (interaction.commandName === 'declinetrade') {
+      const trade = data.pendingTrade;
+      if (!trade) return interaction.reply({ content: "❌ There's no pending trade.", ephemeral: true });
+      if (userId !== trade.to && userId !== trade.from) return interaction.reply({ content: "❌ You're not part of this trade.", ephemeral: true });
+
+      data.pendingTrade = null;
+      saveData(data, guildId);
+      return interaction.reply(`❌ Trade cancelled.`);
     }
 
     // ── STANDINGS ─────────────────────────────────────────────────
     if (interaction.commandName === 'standings') {
       await interaction.deferReply();
-
-      if (data.players.length === 0) return interaction.editReply("No players in the draft yet.");
+      if (!data.players.length) return interaction.editReply("No players in the draft yet.");
       if (data.phase === "none") return interaction.editReply("The draft hasn't started yet.");
 
       const isWorlds = data.phase === "worlds" || data.phase === "worlds_finished";
-      const scoreFn = isWorlds ? getTeamWorldsScore : getTeamSeasonScore;
+      const scoreFn  = isWorlds ? getTeamWorldsScore : getTeamSeasonScore;
       const phaseLabel = isWorlds ? "Worlds" : "Season";
 
       const playerScores = await calcStandings(data, scoreFn);
       const medals = ['🥇', '🥈', '🥉'];
 
-      let desc = "";
-      for (let i = 0; i < playerScores.length; i++) {
-        const { player, totalScore } = playerScores[i];
+      const desc = playerScores.map(({ player, totalScore }, i) => {
         const teams = data.teamsDrafted[player] || [];
-        const medal = medals[i] || `**${i + 1}.**`;
-        const avg = teams.length > 0 ? (totalScore / teams.length).toFixed(1) : "0.0";
-        desc += `${medal} <@${player}> — **${totalScore} pts** *(avg ${avg}/team)*\n`;
-        if (teams.length > 0) {
-          desc += `Teams: ${teams.map(t => `FRC ${t}`).join(', ')}\n`;
-        } else {
-          desc += `No teams drafted yet.\n`;
-        }
-        desc += "\n";
-      }
+        const avg = teams.length ? (totalScore / teams.length).toFixed(1) : "0.0";
+        const teamsLine = teams.length ? `Teams: ${teams.map(t => `FRC ${t}`).join(', ')}` : "No teams drafted yet.";
+        return `${medals[i] || `**${i + 1}.**`} <@${player}> — **${totalScore} pts** *(avg ${avg}/team)*\n${teamsLine}`;
+      }).join('\n\n');
 
       const embed = new EmbedBuilder()
         .setTitle(`📊 Fantasy Standings — ${phaseLabel}`)
@@ -349,39 +384,33 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'score') {
       await interaction.deferReply();
       const teamNumber = interaction.options.getInteger('team');
-      const tbaHeaders = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
 
       const [teamName, events] = await Promise.all([
         getTeamName(teamNumber),
-        safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, tbaHeaders)
+        safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA)
       ]);
 
-      if (!events || events.length === 0) {
-        return interaction.editReply(`No 2026 events found for FRC ${teamNumber}.`);
-      }
+      if (!events?.length) return interaction.editReply(`No 2026 events found for FRC ${teamNumber}.`);
 
       const regularEvents = events
         .filter(e => e.event_type === 0 || e.event_type === 1)
         .sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
         .slice(0, 2);
 
-      if (regularEvents.length === 0) {
-        return interaction.editReply(`No regular season events found for **${teamName}** in 2026.`);
-      }
+      if (!regularEvents.length) return interaction.editReply(`No regular season events found for **${teamName}** in 2026.`);
 
-      let grandTotal = 0;
-      let eventCount = 0;
+      const dpResults = await Promise.all(
+        regularEvents.map(ev => safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`, TBA))
+      );
+
+      let grandTotal = 0, eventCount = 0;
       let desc = `**${teamName}**\n\n`;
 
-      for (const ev of regularEvents) {
-        const dp = await safeFetch(
-          `https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`,
-          tbaHeaders
-        );
-        const pts = dp?.points?.[`frc${teamNumber}`];
+      for (let i = 0; i < regularEvents.length; i++) {
+        const ev  = regularEvents[i];
+        const pts = dpResults[i]?.points?.[`frc${teamNumber}`];
         const typeLabel = ev.event_type === 0 ? 'Regional' : 'District';
         desc += `**${ev.name}** *(${typeLabel} — ${ev.start_date})*\n`;
-
         if (pts) {
           desc += `> Qual points:     **${pts.qual_points}**\n`;
           desc += `> Alliance points: **${pts.alliance_points}**\n`;
@@ -395,50 +424,36 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      if (eventCount === 1) {
-        desc += `*Only 1 event played — points doubled*\n`;
-        grandTotal *= 2;
-      }
-
+      if (eventCount === 1) { desc += `*Only 1 event played — points doubled*\n`; grandTotal *= 2; }
       desc += `\n**Fantasy Season Total: ${grandTotal} pts**`;
 
-      const embed = new EmbedBuilder()
-        .setTitle(`📋 Score Breakdown`)
-        .setDescription(desc)
-        .setColor(0x00AE86);
-
-      return interaction.editReply({ embeds: [embed] });
+      return interaction.editReply({ embeds: [new EmbedBuilder().setTitle(`📋 Score Breakdown`).setDescription(desc).setColor(0x00AE86)] });
     }
 
     // ── SHOW ALL FANTASY TEAMS ────────────────────────────────────
     if (interaction.commandName === 'teams') {
-      if (data.players.length === 0) return interaction.reply("No players in the draft yet.");
+      if (!data.players.length) return interaction.reply("No players in the draft yet.");
+      await interaction.deferReply();
 
-      const embed = new EmbedBuilder().setTitle("Fantasy Draft Teams").setColor(0x00AE86);
-      let desc = "";
-
-      for (const player of data.players) {
+      const lines = await Promise.all(data.players.map(async player => {
         const owned = data.teamsDrafted[player] || [];
-        desc += `**<@${player}>** (${owned.length} teams)\n`;
-        if (owned.length > 0) {
-          for (const t of owned) {
-            desc += `• ${await getTeamName(t)}\n`;
-          }
-        } else {
-          desc += "No teams drafted yet.\n";
-        }
-        desc += "\n";
-      }
+        const names = await Promise.all(owned.map(getTeamName));
+        return `**<@${player}>** (${owned.length} teams)\n` +
+          (names.length ? names.map(n => `• ${n}`).join('\n') : "No teams drafted yet.");
+      }));
 
-      embed.setDescription(desc);
-      return interaction.reply({ embeds: [embed] });
+      const embed = new EmbedBuilder()
+        .setTitle("Fantasy Draft Teams")
+        .setDescription(lines.join('\n\n'))
+        .setColor(0x00AE86);
+
+      return interaction.editReply({ embeds: [embed] });
     }
 
     // ── SEARCH TEAM BY NAME ───────────────────────────────────────
     if (interaction.commandName === 'team') {
       await interaction.deferReply();
       const search = interaction.options.getString('name').toLowerCase();
-
       const allTeams = await loadSeasonTeams();
       const matches = [];
 
@@ -450,32 +465,24 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      if (matches.length === 0) return interaction.editReply(`No teams found for "${search}".`);
+      if (!matches.length) return interaction.editReply(`No teams found for "${search}".`);
 
-      const embed = new EmbedBuilder()
-        .setTitle(`Teams matching "${search}"`)
-        .setDescription(matches.join('\n'))
-        .setColor(0x00AE86);
-
-      return interaction.editReply({ embeds: [embed] });
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder().setTitle(`Teams matching "${search}"`).setDescription(matches.join('\n')).setColor(0x00AE86)
+      ]});
     }
 
     // ── IDENTIFY TEAM BY NUMBER ───────────────────────────────────
     if (interaction.commandName === 'team_identify') {
       await interaction.deferReply();
-      const number = interaction.options.getInteger('number');
-      const name = await getTeamName(number);
+      const name = await getTeamName(interaction.options.getInteger('number'));
       return interaction.editReply(`🔍 **${name}**`);
     }
 
     // ── RESET DRAFT ───────────────────────────────────────────────
     if (interaction.commandName === 'reset_draft') {
-      const confirm = interaction.options.getString('confirm');
-      if (confirm !== "RESET") return interaction.reply("Type `RESET` to confirm.");
-      if (data.players.length && userId !== data.players[0]) {
-        return interaction.reply("❌ Only the host can reset.");
-      }
-
+      if (interaction.options.getString('confirm') !== "RESET") return interaction.reply("Type `RESET` to confirm.");
+      if (data.players.length && userId !== data.players[0]) return interaction.reply("❌ Only the host can reset.");
       saveData(freshData(), guildId);
       return interaction.reply("🧹 Draft fully reset.");
     }

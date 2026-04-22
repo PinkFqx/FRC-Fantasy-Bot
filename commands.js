@@ -13,6 +13,17 @@ const commands = [
     .setName('standings')
     .setDescription('Show live fantasy standings with real scores from TBA'),
   new SlashCommandBuilder()
+    .setName('trade')
+    .setDescription('Propose a trade with another player')
+    .addIntegerOption(opt => opt.setName('offer').setDescription('Team number you are giving away').setRequired(true))
+    .addIntegerOption(opt => opt.setName('request').setDescription('Team number you want in return').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('accepttrade')
+    .setDescription('Accept the trade proposed to you'),
+  new SlashCommandBuilder()
+    .setName('declinetrade')
+    .setDescription('Decline or cancel the current pending trade'),
+  new SlashCommandBuilder()
     .setName('score')
     .setDescription('Show a full point breakdown for any FRC team')
     .addIntegerOption(opt => opt.setName('team').setDescription('FRC team number').setRequired(true)),
