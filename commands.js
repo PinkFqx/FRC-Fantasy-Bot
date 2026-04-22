@@ -3,6 +3,7 @@ const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
 const commands = [
   new SlashCommandBuilder().setName('join_draft').setDescription('Join the fantasy draft'),
+  new SlashCommandBuilder().setName('addbot').setDescription('Add a CPU player to the draft that auto-picks randomly'),
   new SlashCommandBuilder().setName('start_draft').setDescription('Start the season draft'),
   new SlashCommandBuilder().setName('start_worlds_draft').setDescription('Start the worlds draft (calculates season standings automatically)'),
   new SlashCommandBuilder()

@@ -12,6 +12,9 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
+// Special ID for the CPU bot player
+const BOT_PLAYER_ID = "BOT_PLAYER";
+
 // ---------------- DATA (per-server) ----------------
 function freshData() {
   return {
@@ -63,10 +66,7 @@ const TBA = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
 async function getTeamName(teamNumber) {
   if (teamNameCache.has(teamNumber)) return teamNameCache.get(teamNumber);
   try {
-    const res = await fetch(
-      `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}`,
-      TBA
-    );
+    const res = await fetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}`, TBA);
     if (!res.ok) { teamNameCache.set(teamNumber, `Team ${teamNumber}`); return `Team ${teamNumber}`; }
     const data = await res.json();
     const name = `${data.nickname || 'Unknown'} (FRC ${teamNumber})`;
@@ -96,11 +96,14 @@ async function loadWorldsTeams() {
   return teams?.map(t => t.team_number) || [];
 }
 
+// ---------------- DISPLAY HELPERS ----------------
+function playerDisplay(id) {
+  return id === BOT_PLAYER_ID ? "🤖 **CPU**" : `<@${id}>`;
+}
+
 // ---------------- SCORING ----------------
 async function getTeamSeasonScore(teamNumber) {
-  const events = await safeFetch(
-    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA
-  );
+  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA);
   if (!events?.length) return 0;
 
   const regularEvents = events
@@ -121,9 +124,7 @@ async function getTeamSeasonScore(teamNumber) {
 }
 
 async function getTeamWorldsScore(teamNumber) {
-  const events = await safeFetch(
-    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA
-  );
+  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA);
   if (!events?.length) return 0;
 
   let total = 0;
@@ -161,6 +162,43 @@ function findOwner(data, team) {
   return null;
 }
 
+// ---------------- CPU AUTO-PICK ----------------
+// Called recursively until a human's turn or draft ends
+async function doBotPick(data, guildId, channel) {
+  if (data.phase === "finished" || data.phase === "worlds_finished") return;
+  if (getCurrentPlayer(data) !== BOT_PLAYER_ID) return;
+
+  const pool = data.phase === "worlds" ? data.worldsTeams : data.seasonTeams;
+  const drafted = new Set(Object.values(data.teamsDrafted).flat());
+  const available = pool.filter(t => !drafted.has(t));
+  if (!available.length) return;
+
+  // Pick randomly from the available pool
+  const team = available[Math.floor(Math.random() * available.length)];
+  data.teamsDrafted[BOT_PLAYER_ID].push(team);
+  data.currentPick++;
+
+  const name = await getTeamName(team);
+  const maxPicks = data.players.length * 6;
+
+  if (data.currentPick >= maxPicks) {
+    data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
+    saveData(data, guildId);
+    await channel.send(`🤖 **CPU** picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
+    return;
+  }
+
+  saveData(data, guildId);
+  const next = getCurrentPlayer(data);
+  await channel.send(`🤖 **CPU** picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
+
+  // If it's still the bot's turn (consecutive picks in snake), keep going
+  if (next === BOT_PLAYER_ID) {
+    await new Promise(r => setTimeout(r, 1500)); // small delay so it doesn't feel instant
+    await doBotPick(data, guildId, channel);
+  }
+}
+
 // ---------------- GLOBAL ERROR SAFETY ----------------
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection (bot kept alive):', err);
@@ -191,7 +229,7 @@ client.on('interactionCreate', async (interaction) => {
       if (setToOpen) {
         data.draftOpen = true;
         saveData(data, guildId);
-        return interaction.reply("✅ **Draft is now OPEN**\nPlayers can now join using `/join_draft`");
+        return interaction.reply("✅ **Draft is now OPEN**\nPlayers can now join using `/join_draft` or add a CPU with `/addbot`");
       } else {
         saveData(freshData(), guildId);
         return interaction.reply("🛑 **Draft has been CLOSED and RESET**");
@@ -205,6 +243,15 @@ client.on('interactionCreate', async (interaction) => {
       data.players.push(userId);
       saveData(data, guildId);
       return interaction.reply(`✅ <@${userId}> has joined the draft!`);
+    }
+
+    // ── ADD BOT PLAYER ────────────────────────────────────────────
+    if (interaction.commandName === 'addbot') {
+      if (!data.draftOpen) return interaction.reply("❌ Draft joining is currently closed.");
+      if (data.players.includes(BOT_PLAYER_ID)) return interaction.reply("🤖 CPU is already in the draft.");
+      data.players.push(BOT_PLAYER_ID);
+      saveData(data, guildId);
+      return interaction.reply("🤖 **CPU player added to the draft!** It will auto-pick randomly when it's its turn.");
     }
 
     // ── START SEASON DRAFT ────────────────────────────────────────
@@ -222,9 +269,16 @@ client.on('interactionCreate', async (interaction) => {
       data.pendingTrade = null;
       saveData(data, guildId);
 
-      return interaction.editReply(
-        `🚀 **Season Draft Started!**\nTeams loaded: ${data.seasonTeams.length}\nFirst pick: <@${getCurrentPlayer(data)}>`
+      const first = getCurrentPlayer(data);
+      await interaction.editReply(
+        `🚀 **Season Draft Started!**\nTeams loaded: ${data.seasonTeams.length}\nFirst pick: ${playerDisplay(first)}`
       );
+
+      // If CPU goes first, auto-pick immediately
+      if (first === BOT_PLAYER_ID) {
+        await doBotPick(data, guildId, interaction.channel);
+      }
+      return;
     }
 
     // ── START WORLDS DRAFT ────────────────────────────────────────
@@ -248,12 +302,17 @@ client.on('interactionCreate', async (interaction) => {
 
       const medals = ['🥇', '🥈', '🥉'];
       const standingsText = seasonStandings
-        .map((p, i) => `${medals[i] || `${i + 1}.`} <@${p.player}> — **${p.totalScore} pts**`)
+        .map((p, i) => `${medals[i] || `${i + 1}.`} ${playerDisplay(p.player)} — **${p.totalScore} pts**`)
         .join('\n');
 
-      return interaction.editReply(
-        `🌍 **Worlds Draft Started!**\n\n**Final Season Standings:**\n${standingsText}\n\n**Draft Order** (worst → best):\n${data.draftOrder.map(p => `<@${p}>`).join(' → ')}\n\nFirst pick: <@${data.draftOrder[0]}>`
+      await interaction.editReply(
+        `🌍 **Worlds Draft Started!**\n\n**Final Season Standings:**\n${standingsText}\n\n**Draft Order** (worst → best):\n${data.draftOrder.map(playerDisplay).join(' → ')}\n\nFirst pick: ${playerDisplay(data.draftOrder[0])}`
       );
+
+      if (getCurrentPlayer(data) === BOT_PLAYER_ID) {
+        await doBotPick(data, guildId, interaction.channel);
+      }
+      return;
     }
 
     // ── PICK TEAM ─────────────────────────────────────────────────
@@ -270,17 +329,24 @@ client.on('interactionCreate', async (interaction) => {
       data.teamsDrafted[current].push(team);
       data.currentPick++;
 
-      const [name] = await Promise.all([getTeamName(team)]);
+      const name = await getTeamName(team);
       const maxPicks = data.players.length * 6;
 
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, guildId);
-        return interaction.editReply(`🏁 **Draft complete!**\n✅ <@${userId}> picked **${name}**\n\nRun \`/standings\` to see the results!`);
+        return interaction.editReply(`✅ <@${userId}> picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
       }
 
       saveData(data, guildId);
-      return interaction.editReply(`✅ <@${userId}> picked **${name}**\n\n👉 Next pick: <@${getCurrentPlayer(data)}>`);
+      const next = getCurrentPlayer(data);
+      await interaction.editReply(`✅ <@${userId}> picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
+
+      // Trigger CPU auto-pick if it's now the bot's turn
+      if (next === BOT_PLAYER_ID) {
+        await doBotPick(data, guildId, interaction.channel);
+      }
+      return;
     }
 
     // ── TRADE ─────────────────────────────────────────────────────
@@ -297,24 +363,24 @@ client.on('interactionCreate', async (interaction) => {
       const theirOwner = findOwner(data, wanting);
       if (!theirOwner) return interaction.reply({ content: `❌ FRC ${wanting} hasn't been drafted yet.`, ephemeral: true });
       if (theirOwner === userId) return interaction.reply({ content: "❌ You already own that team.", ephemeral: true });
-
+      if (theirOwner === BOT_PLAYER_ID) return interaction.reply({ content: "❌ You can't trade with the CPU.", ephemeral: true });
       if (data.pendingTrade) return interaction.reply({ content: "❌ There's already a pending trade. It must be accepted, declined, or cancelled first.", ephemeral: true });
 
       data.pendingTrade = { from: userId, offering, wanting, to: theirOwner };
       saveData(data, guildId);
 
       const [offerName, wantName] = await Promise.all([getTeamName(offering), getTeamName(wanting)]);
-      const embed = new EmbedBuilder()
-        .setTitle("🔄 Trade Proposal")
-        .setDescription(
-          `<@${userId}> wants to trade with <@${theirOwner}>\n\n` +
-          `**Offering:** ${offerName}\n` +
-          `**Requesting:** ${wantName}\n\n` +
-          `<@${theirOwner}>: run \`/accepttrade\` to accept or \`/declinetrade\` to decline.`
-        )
-        .setColor(0xF0A500);
-
-      return interaction.reply({ embeds: [embed] });
+      return interaction.reply({ embeds: [
+        new EmbedBuilder()
+          .setTitle("🔄 Trade Proposal")
+          .setDescription(
+            `<@${userId}> wants to trade with <@${theirOwner}>\n\n` +
+            `**Offering:** ${offerName}\n` +
+            `**Requesting:** ${wantName}\n\n` +
+            `<@${theirOwner}>: run \`/accepttrade\` to accept or \`/declinetrade\` to decline.`
+          )
+          .setColor(0xF0A500)
+      ]});
     }
 
     // ── ACCEPT TRADE ──────────────────────────────────────────────
@@ -323,7 +389,6 @@ client.on('interactionCreate', async (interaction) => {
       if (!trade) return interaction.reply({ content: "❌ There's no pending trade.", ephemeral: true });
       if (userId !== trade.to) return interaction.reply({ content: "❌ This trade isn't directed at you.", ephemeral: true });
 
-      // Swap teams
       data.teamsDrafted[trade.from] = data.teamsDrafted[trade.from].filter(t => t !== trade.offering);
       data.teamsDrafted[trade.to]   = data.teamsDrafted[trade.to].filter(t => t !== trade.wanting);
       data.teamsDrafted[trade.from].push(trade.wanting);
@@ -342,10 +407,9 @@ client.on('interactionCreate', async (interaction) => {
       const trade = data.pendingTrade;
       if (!trade) return interaction.reply({ content: "❌ There's no pending trade.", ephemeral: true });
       if (userId !== trade.to && userId !== trade.from) return interaction.reply({ content: "❌ You're not part of this trade.", ephemeral: true });
-
       data.pendingTrade = null;
       saveData(data, guildId);
-      return interaction.reply(`❌ Trade cancelled.`);
+      return interaction.reply("❌ Trade cancelled.");
     }
 
     // ── STANDINGS ─────────────────────────────────────────────────
@@ -365,19 +429,19 @@ client.on('interactionCreate', async (interaction) => {
         const teams = data.teamsDrafted[player] || [];
         const avg = teams.length ? (totalScore / teams.length).toFixed(1) : "0.0";
         const teamsLine = teams.length ? `Teams: ${teams.map(t => `FRC ${t}`).join(', ')}` : "No teams drafted yet.";
-        return `${medals[i] || `**${i + 1}.**`} <@${player}> — **${totalScore} pts** *(avg ${avg}/team)*\n${teamsLine}`;
+        return `${medals[i] || `**${i + 1}.**`} ${playerDisplay(player)} — **${totalScore} pts** *(avg ${avg}/team)*\n${teamsLine}`;
       }).join('\n\n');
 
-      const embed = new EmbedBuilder()
-        .setTitle(`📊 Fantasy Standings — ${phaseLabel}`)
-        .setDescription(desc)
-        .setColor(0x00AE86)
-        .setFooter({ text: isWorlds
-          ? "Points: Championship division ranking, playoff, and award points via TBA"
-          : "Points: First 2 event district/regional points via TBA (1 event = doubled)"
-        });
-
-      return interaction.editReply({ embeds: [embed] });
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder()
+          .setTitle(`📊 Fantasy Standings — ${phaseLabel}`)
+          .setDescription(desc)
+          .setColor(0x00AE86)
+          .setFooter({ text: isWorlds
+            ? "Points: Championship division ranking, playoff, and award points via TBA"
+            : "Points: First 2 event district/regional points via TBA (1 event = doubled)"
+          })
+      ]});
     }
 
     // ── SCORE BREAKDOWN ───────────────────────────────────────────
@@ -427,7 +491,9 @@ client.on('interactionCreate', async (interaction) => {
       if (eventCount === 1) { desc += `*Only 1 event played — points doubled*\n`; grandTotal *= 2; }
       desc += `\n**Fantasy Season Total: ${grandTotal} pts**`;
 
-      return interaction.editReply({ embeds: [new EmbedBuilder().setTitle(`📋 Score Breakdown`).setDescription(desc).setColor(0x00AE86)] });
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder().setTitle(`📋 Score Breakdown`).setDescription(desc).setColor(0x00AE86)
+      ]});
     }
 
     // ── SHOW ALL FANTASY TEAMS ────────────────────────────────────
@@ -438,16 +504,13 @@ client.on('interactionCreate', async (interaction) => {
       const lines = await Promise.all(data.players.map(async player => {
         const owned = data.teamsDrafted[player] || [];
         const names = await Promise.all(owned.map(getTeamName));
-        return `**<@${player}>** (${owned.length} teams)\n` +
+        return `**${playerDisplay(player)}** (${owned.length} teams)\n` +
           (names.length ? names.map(n => `• ${n}`).join('\n') : "No teams drafted yet.");
       }));
 
-      const embed = new EmbedBuilder()
-        .setTitle("Fantasy Draft Teams")
-        .setDescription(lines.join('\n\n'))
-        .setColor(0x00AE86);
-
-      return interaction.editReply({ embeds: [embed] });
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder().setTitle("Fantasy Draft Teams").setDescription(lines.join('\n\n')).setColor(0x00AE86)
+      ]});
     }
 
     // ── SEARCH TEAM BY NAME ───────────────────────────────────────
@@ -456,17 +519,11 @@ client.on('interactionCreate', async (interaction) => {
       const search = interaction.options.getString('name').toLowerCase();
       const allTeams = await loadSeasonTeams();
       const matches = [];
-
       for (const num of allTeams) {
         const name = await getTeamName(num);
-        if (name.toLowerCase().includes(search)) {
-          matches.push(name);
-          if (matches.length >= 15) break;
-        }
+        if (name.toLowerCase().includes(search)) { matches.push(name); if (matches.length >= 15) break; }
       }
-
       if (!matches.length) return interaction.editReply(`No teams found for "${search}".`);
-
       return interaction.editReply({ embeds: [
         new EmbedBuilder().setTitle(`Teams matching "${search}"`).setDescription(matches.join('\n')).setColor(0x00AE86)
       ]});
@@ -475,8 +532,7 @@ client.on('interactionCreate', async (interaction) => {
     // ── IDENTIFY TEAM BY NUMBER ───────────────────────────────────
     if (interaction.commandName === 'team_identify') {
       await interaction.deferReply();
-      const name = await getTeamName(interaction.options.getInteger('number'));
-      return interaction.editReply(`🔍 **${name}**`);
+      return interaction.editReply(`🔍 **${await getTeamName(interaction.options.getInteger('number'))}**`);
     }
 
     // ── RESET DRAFT ───────────────────────────────────────────────
