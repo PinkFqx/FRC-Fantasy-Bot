@@ -86,6 +86,85 @@ async function loadWorldsTeams() {
   return teams?.map(t => t.team_number) || [];
 }
 
+// ---------------- SCORING ----------------
+
+// Season: points from first 2 regular-season events (regional or district, type 0 or 1).
+// If only 1 event has data, double it.
+async function getTeamSeasonScore(teamNumber) {
+  const tbaHeaders = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
+  const events = await safeFetch(
+    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`,
+    tbaHeaders
+  );
+  if (!events || events.length === 0) return 0;
+
+  // Keep only Regional (0) and District (1) events, sorted by start date
+  const regularEvents = events
+    .filter(e => e.event_type === 0 || e.event_type === 1)
+    .sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
+    .slice(0, 2);
+
+  if (regularEvents.length === 0) return 0;
+
+  let total = 0;
+  let counted = 0;
+  for (const ev of regularEvents) {
+    const dp = await safeFetch(
+      `https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`,
+      tbaHeaders
+    );
+    const pts = dp?.points?.[`frc${teamNumber}`]?.total;
+    if (pts != null) {
+      total += pts;
+      counted++;
+    }
+  }
+
+  // Only 1 event played (or only 1 has results yet) — double the points
+  if (counted === 1) total *= 2;
+
+  return total;
+}
+
+// Worlds: points from Championship Division events (type 3) and Finals (type 4).
+async function getTeamWorldsScore(teamNumber) {
+  const tbaHeaders = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
+  const events = await safeFetch(
+    `https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`,
+    tbaHeaders
+  );
+  if (!events || events.length === 0) return 0;
+
+  const cmpEvents = events.filter(e => e.event_type === 3 || e.event_type === 4);
+
+  let total = 0;
+  for (const ev of cmpEvents) {
+    const dp = await safeFetch(
+      `https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`,
+      tbaHeaders
+    );
+    const pts = dp?.points?.[`frc${teamNumber}`]?.total;
+    if (pts != null) total += pts;
+  }
+  return total;
+}
+
+// Calculate all player scores and return sorted array (highest first)
+async function calcStandings(data, scoreFn) {
+  const playerScores = [];
+  for (const player of data.players) {
+    const teams = data.teamsDrafted[player] || [];
+    let totalScore = 0;
+    for (const team of teams) {
+      totalScore += await scoreFn(team);
+    }
+    playerScores.push({ player, totalScore });
+  }
+  playerScores.sort((a, b) => b.totalScore - a.totalScore);
+  return playerScores;
+}
+
+// ---------------- DRAFT HELPERS ----------------
 function getCurrentPlayer(data) {
   const n = data.draftOrder.length;
   const round = Math.floor(data.currentPick / n);
@@ -107,7 +186,7 @@ client.on('interactionCreate', async (interaction) => {
 
   try {
 
-    // DRAFT STATUS - Main control command
+    // ── DRAFT STATUS ──────────────────────────────────────────────
     if (interaction.commandName === 'draftstatus') {
       const setToOpen = interaction.options.getBoolean('open');
 
@@ -119,8 +198,7 @@ client.on('interactionCreate', async (interaction) => {
         data.draftOpen = true;
         saveData(data);
         return interaction.reply("✅ **Draft is now OPEN**\nPlayers can now join using `/join_draft`");
-      } 
-      else {
+      } else {
         const freshData = {
           players: [],
           draftOrder: [],
@@ -137,12 +215,11 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // JOIN DRAFT
+    // ── JOIN DRAFT ────────────────────────────────────────────────
     if (interaction.commandName === 'join_draft') {
       if (!data.draftOpen) {
-        return interaction.reply("❌ Draft joining is currently closed.\nAsk the host to run `/draftstatus true`");
+        return interaction.reply("❌ Draft joining is currently closed.\nAsk the host to run `/draftstatus open:true`");
       }
-
       if (!data.players.includes(userId)) {
         data.players.push(userId);
         saveData(data);
@@ -151,7 +228,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply("You are already in the draft.");
     }
 
-    // START SEASON DRAFT
+    // ── START SEASON DRAFT ────────────────────────────────────────
     if (interaction.commandName === 'start_draft') {
       await interaction.deferReply();
 
@@ -172,37 +249,54 @@ client.on('interactionCreate', async (interaction) => {
       );
     }
 
-    // START WORLDS DRAFT
+    // ── START WORLDS DRAFT ────────────────────────────────────────
+    // Calculates final season standings live, then reverses them for draft order
     if (interaction.commandName === 'start_worlds_draft') {
       await interaction.deferReply();
 
       if (data.players.length === 0) return interaction.editReply("❌ No players have joined yet.");
       if (userId !== data.players[0]) return interaction.editReply("❌ Only the host can start the draft.");
 
+      await interaction.editReply("⏳ Calculating final season standings from TBA… this may take a moment.");
+
+      const seasonStandings = await calcStandings(data, getTeamSeasonScore);
+      // Store best→worst; draft order will reverse it (worst picks first)
+      data.lastSeasonStandings = seasonStandings.map(p => p.player);
+
       data.phase = "worlds";
       data.worldsTeams = await loadWorldsTeams();
-      data.draftOrder = data.lastSeasonStandings?.length 
-        ? [...data.lastSeasonStandings].reverse() 
-        : [...data.players];
+      data.draftOrder = [...data.lastSeasonStandings].reverse(); // worst to best picks first
       data.currentPick = 0;
       data.teamsDrafted = Object.fromEntries(data.players.map(p => [p, []]));
       data.draftOpen = false;
       saveData(data);
 
-      return interaction.editReply(`🌍 **Worlds Draft Started!**`);
+      const medals = ['🥇', '🥈', '🥉'];
+      const standingsText = seasonStandings
+        .map((p, i) => `${medals[i] || `${i + 1}.`} <@${p.player}> — **${p.totalScore} pts**`)
+        .join('\n');
+
+      const draftOrderText = data.draftOrder.map(p => `<@${p}>`).join(' → ');
+
+      return interaction.editReply(
+        `🌍 **Worlds Draft Started!**\n\n**Final Season Standings:**\n${standingsText}\n\n**Worlds Draft Order** (worst → best):\n${draftOrderText}\n\nFirst pick: <@${data.draftOrder[0]}>`
+      );
     }
 
-    // PICK TEAM
+    // ── PICK TEAM ─────────────────────────────────────────────────
     if (interaction.commandName === 'pick') {
       const team = interaction.options.getInteger('team');
       const current = getCurrentPlayer(data);
 
-      if (userId !== current) return interaction.reply("⛔ Not your turn.");
+      if (userId !== current) return interaction.reply("⛔ It's not your turn.");
 
       const pool = data.phase === "worlds" ? data.worldsTeams : data.seasonTeams;
 
       if (!pool.includes(team)) return interaction.reply(`⛔ Team ${team} is not in the pool.`);
-      if (data.teamsDrafted[current].includes(team)) return interaction.reply(`⛔ You already drafted that team.`);
+
+      for (const picks of Object.values(data.teamsDrafted)) {
+        if (picks.includes(team)) return interaction.reply(`⛔ Team ${team} has already been drafted.`);
+      }
 
       data.teamsDrafted[current].push(team);
       data.currentPick++;
@@ -213,15 +307,55 @@ client.on('interactionCreate', async (interaction) => {
       if (data.currentPick >= maxPicks) {
         data.phase = "finished";
         saveData(data);
-        return interaction.reply(`🏁 Draft complete!\n✅ <@${userId}> picked ${name}`);
+        return interaction.reply(`🏁 **Draft complete!**\n✅ <@${userId}> picked **${name}**\n\nRun \`/standings\` to see the final results!`);
       }
 
       const next = getCurrentPlayer(data);
       saveData(data);
-      return interaction.reply(`✅ <@${userId}> picked **${name}**\n\n👉 Next: <@${next}>`);
+      return interaction.reply(`✅ <@${userId}> picked **${name}**\n\n👉 Next pick: <@${next}>`);
     }
 
-    // SHOW ALL FANTASY TEAMS
+    // ── STANDINGS ─────────────────────────────────────────────────
+    if (interaction.commandName === 'standings') {
+      await interaction.deferReply();
+
+      if (data.players.length === 0) return interaction.editReply("No players in the draft yet.");
+      if (data.phase === "none") return interaction.editReply("The draft hasn't started yet.");
+
+      const isWorlds = data.phase === "worlds" || data.phase === "finished";
+      const scoreFn = isWorlds ? getTeamWorldsScore : getTeamSeasonScore;
+      const phaseLabel = isWorlds ? "Worlds" : "Season";
+
+      const playerScores = await calcStandings(data, scoreFn);
+      const medals = ['🥇', '🥈', '🥉'];
+
+      let desc = "";
+      for (let i = 0; i < playerScores.length; i++) {
+        const { player, totalScore } = playerScores[i];
+        const teams = data.teamsDrafted[player] || [];
+        const medal = medals[i] || `**${i + 1}.**`;
+        desc += `${medal} <@${player}> — **${totalScore} pts**\n`;
+        if (teams.length > 0) {
+          desc += `Teams: ${teams.map(t => `FRC ${t}`).join(', ')}\n`;
+        } else {
+          desc += `No teams drafted yet.\n`;
+        }
+        desc += "\n";
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle(`📊 Fantasy Standings — ${phaseLabel}`)
+        .setDescription(desc)
+        .setColor(0x00AE86)
+        .setFooter({ text: isWorlds
+          ? "Points: Championship division ranking, playoff, and award points via TBA"
+          : "Points: First 2 event district/regional points via TBA (1 event = doubled)"
+        });
+
+      return interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── SHOW ALL FANTASY TEAMS ────────────────────────────────────
     if (interaction.commandName === 'teams') {
       if (data.players.length === 0) return interaction.reply("No players in the draft yet.");
 
@@ -245,7 +379,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ embeds: [embed] });
     }
 
-    // SEARCH TEAM BY NAME
+    // ── SEARCH TEAM BY NAME ───────────────────────────────────────
     if (interaction.commandName === 'team') {
       await interaction.deferReply();
       const search = interaction.options.getString('name').toLowerCase();
@@ -271,15 +405,15 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply({ embeds: [embed] });
     }
 
-    // IDENTIFY TEAM BY NUMBER
+    // ── IDENTIFY TEAM BY NUMBER ───────────────────────────────────
     if (interaction.commandName === 'team_identify') {
       await interaction.deferReply();
       const number = interaction.options.getInteger('number');
       const name = await getTeamName(number);
-      return interaction.editReply(`🔍 Team ${number}: **${name}**`);
+      return interaction.editReply(`🔍 **${name}**`);
     }
 
-    // RESET DRAFT (backup)
+    // ── RESET DRAFT (backup) ──────────────────────────────────────
     if (interaction.commandName === 'reset_draft') {
       const confirm = interaction.options.getString('confirm');
       if (confirm !== "RESET") return interaction.reply("Type `RESET` to confirm.");
@@ -297,8 +431,8 @@ client.on('interactionCreate', async (interaction) => {
 
   } catch (err) {
     console.error(err);
-    if (interaction.deferred) interaction.editReply("❌ Error occurred.").catch(() => {});
-    else if (!interaction.replied) interaction.reply("❌ Error occurred.").catch(() => {});
+    if (interaction.deferred) interaction.editReply("❌ An error occurred.").catch(() => {});
+    else if (!interaction.replied) interaction.reply("❌ An error occurred.").catch(() => {});
   }
 });
 

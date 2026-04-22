@@ -4,11 +4,14 @@ const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 const commands = [
   new SlashCommandBuilder().setName('join_draft').setDescription('Join the fantasy draft'),
   new SlashCommandBuilder().setName('start_draft').setDescription('Start the season draft'),
-  new SlashCommandBuilder().setName('start_worlds_draft').setDescription('Start the worlds draft'),
+  new SlashCommandBuilder().setName('start_worlds_draft').setDescription('Start the worlds draft (calculates season standings automatically)'),
   new SlashCommandBuilder()
     .setName('pick')
     .setDescription('Pick a team')
     .addIntegerOption(opt => opt.setName('team').setDescription('FRC team number').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('standings')
+    .setDescription('Show live fantasy standings with real scores from TBA'),
   new SlashCommandBuilder().setName('teams').setDescription('Show all fantasy teams and their owners'),
   new SlashCommandBuilder()
     .setName('team')
