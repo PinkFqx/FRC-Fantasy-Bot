@@ -416,6 +416,71 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply({ embeds: [embed] });
     }
 
+    // ── SCORE BREAKDOWN ──────────────────────────────────────────
+    if (interaction.commandName === 'score') {
+      await interaction.deferReply();
+      const teamNumber = interaction.options.getInteger('team');
+      const tbaHeaders = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
+
+      const [teamName, events] = await Promise.all([
+        getTeamName(teamNumber),
+        safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, tbaHeaders)
+      ]);
+
+      if (!events || events.length === 0) {
+        return interaction.editReply(`No 2026 events found for FRC ${teamNumber}.`);
+      }
+
+      const regularEvents = events
+        .filter(e => e.event_type === 0 || e.event_type === 1)
+        .sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
+        .slice(0, 2);
+
+      if (regularEvents.length === 0) {
+        return interaction.editReply(`No regular season events found for **${teamName}** in 2026.`);
+      }
+
+      let grandTotal = 0;
+      let eventCount = 0;
+      let desc = `**${teamName}**\n\n`;
+
+      for (const ev of regularEvents) {
+        const dp = await safeFetch(
+          `https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`,
+          tbaHeaders
+        );
+        const pts = dp?.points?.[`frc${teamNumber}`];
+        const typeLabel = ev.event_type === 0 ? 'Regional' : 'District';
+        desc += `**${ev.name}** *(${typeLabel} — ${ev.start_date})*\n`;
+
+        if (pts) {
+          desc += `> Qual points:     **${pts.qual_points}**\n`;
+          desc += `> Alliance points: **${pts.alliance_points}**\n`;
+          desc += `> Playoff points:  **${pts.elim_points}**\n`;
+          desc += `> Award points:    **${pts.award_points}**\n`;
+          desc += `> **Event total: ${pts.total} pts**\n\n`;
+          grandTotal += pts.total;
+          eventCount++;
+        } else {
+          desc += `> *No results yet*\n\n`;
+        }
+      }
+
+      if (eventCount === 1) {
+        desc += `*Only 1 event played — points doubled*\n`;
+        grandTotal *= 2;
+      }
+
+      desc += `\n**Fantasy Season Total: ${grandTotal} pts**`;
+
+      const embed = new EmbedBuilder()
+        .setTitle(`📋 Score Breakdown`)
+        .setDescription(desc)
+        .setColor(0x00AE86);
+
+      return interaction.editReply({ embeds: [embed] });
+    }
+
     // ── IDENTIFY TEAM BY NUMBER ───────────────────────────────────
     if (interaction.commandName === 'team_identify') {
       await interaction.deferReply();

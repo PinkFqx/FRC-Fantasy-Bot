@@ -12,6 +12,10 @@ const commands = [
   new SlashCommandBuilder()
     .setName('standings')
     .setDescription('Show live fantasy standings with real scores from TBA'),
+  new SlashCommandBuilder()
+    .setName('score')
+    .setDescription('Show a full point breakdown for any FRC team')
+    .addIntegerOption(opt => opt.setName('team').setDescription('FRC team number').setRequired(true)),
   new SlashCommandBuilder().setName('teams').setDescription('Show all fantasy teams and their owners'),
   new SlashCommandBuilder()
     .setName('team')
