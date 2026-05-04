@@ -127,11 +127,46 @@ async function getTeamWorldsScore(teamNumber) {
   const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/2026`, TBA);
   if (!events?.length) return 0;
 
+  const worldsEvents = events.filter(e => e.event_type === 3 || e.event_type === 4);
+  if (!worldsEvents.length) return 0;
+
   let total = 0;
-  for (const ev of events.filter(e => e.event_type === 3 || e.event_type === 4)) {
-    const dp = await safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`, TBA);
-    const pts = dp?.points?.[`frc${teamNumber}`]?.total;
-    if (pts != null) total += pts;
+  for (const ev of worldsEvents) {
+    const [rankings, alliances, matches, awards] = await Promise.all([
+      safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/rankings`, TBA),
+      safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/alliances`, TBA),
+      safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/matches`, TBA),
+      safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/awards`, TBA)
+    ]);
+
+    const teamKey = `frc${teamNumber}`;
+    const ranking = rankings?.rankings?.find(r => r.team_key === teamKey);
+    if (ranking?.rank != null) {
+      const q = Math.ceil((10 / 1.07) * Math.erf((worldsEvents.length - 2 * ranking.rank + 2) / (1.07 * worldsEvents.length)) + 12);
+      total += q;
+    }
+
+    const allianceIndex = alliances?.findIndex(a => a.picks?.includes(teamKey) || a.captain?.key === teamKey);
+    if (allianceIndex != null && allianceIndex >= 0) total += Math.max(0, 17 - (allianceIndex + 1));
+
+    const finals = matches?.filter(m => m.comp_level === 'f' && (m.winning_alliance === 'red' || m.winning_alliance === 'blue'));
+    const playoffMatches = matches?.filter(m => ['qf', 'sf', 'f'].includes(m.comp_level) && (m.winning_alliance === 'red' || m.winning_alliance === 'blue')) || [];
+    const teamMatches = playoffMatches.filter(m => m.alliances?.red?.team_keys?.includes(teamKey) || m.alliances?.blue?.team_keys?.includes(teamKey));
+    const wonMatches = teamMatches.filter(m => m.alliances?.[m.winning_alliance]?.team_keys?.includes(teamKey));
+    if (wonMatches.length) {
+      const allianceWon = finals?.some(m => (m.alliances?.red?.team_keys?.includes(teamKey) || m.alliances?.blue?.team_keys?.includes(teamKey)) && m.alliances?.[m.winning_alliance]?.team_keys?.includes(teamKey));
+      const beta = allianceWon ? 20 : 7;
+      total += Math.ceil(beta * (wonMatches.length / Math.max(1, teamMatches.filter(m => m.alliances?.[m.winning_alliance]?.team_keys?.includes(teamKey)).length)));
+      if (allianceWon) total += Math.min(10, wonMatches.filter(m => m.comp_level === 'f').length * 5);
+    }
+
+    for (const award of awards || []) {
+      const teamWon = award.team_key === teamKey || award.recipient_team_keys?.includes(teamKey);
+      if (!teamWon) continue;
+      if (award.award_type === 0) total += 10;
+      else if (award.award_type === 9 || award.award_type === 10) total += 8;
+      else total += 5;
+    }
   }
   return total;
 }
