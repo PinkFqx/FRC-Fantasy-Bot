@@ -312,21 +312,18 @@ client.on('interactionCreate', async (interaction) => {
       if (data.players.length > 0 && userId !== data.players[0]) {
         return interaction.reply("❌ Only the draft host can change draft status.");
       }
+      const { REST, Routes } = require('discord.js');
+      const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
       if (setToOpen) {
         data.draftOpen = true;
         saveData(data, guildId);
-        const { REST, Routes } = require('discord.js');
-        const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-        const commands = require('./commands.js').commands || require('./commands.js');
-        await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+        await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: require('./commands.js') });
         return interaction.reply("✅ **Draft is now OPEN**\nPlayers can now join using `/join_draft` or add a CPU with `/addbot`");
       } else {
         saveData(freshData(), guildId);
-        const { REST, Routes } = require('discord.js');
-        const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-        const commands = require('./commands.js').commands || require('./commands.js');
-        const closed = commands.filter(cmd => ['draftstatus', 'standings', 'score', 'teams'].includes(cmd.name));
-        await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: closed });
+        await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), {
+          body: require('./commands.js').filter ? require('./commands.js').filter(cmd => ['draftstatus', 'standings', 'score', 'teams'].includes(cmd.name)) : []
+        });
         return interaction.reply("🛑 **Draft has been CLOSED and RESET**");
       }
     }
