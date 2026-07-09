@@ -260,8 +260,11 @@ async function doBotPick(data, guildId, channel) {
   const available = pool.filter(t => !drafted.has(t));
   if (!available.length) return;
 
-  // Pick randomly from the available pool
-  const team = available[Math.floor(Math.random() * available.length)];
+  // Score all available teams and pick the highest-scoring one
+  const scoreFn = data.phase === "worlds" ? getTeamWorldsScore : getTeamSeasonScore;
+  const scored = await Promise.all(available.map(async t => ({ team: t, score: await scoreFn(t) })));
+  scored.sort((a, b) => b.score - a.score);
+  const team = scored[0].team;
   data.teamsDrafted[BOT_PLAYER_ID].push(team);
   data.currentPick++;
 
