@@ -9,7 +9,7 @@ const {
 const fs = require('fs');
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
 // Special ID for the CPU bot player
@@ -328,7 +328,14 @@ client.on('interactionCreate', async (interaction) => {
       } else {
         saveData(freshData(), guildId);
         await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId), { body: closedCommands });
-        return interaction.reply("🛑 **Draft has been CLOSED and RESET**");
+        // Bulk delete the bot's own recent messages in this channel
+        try {
+          const channel = await client.channels.fetch(interaction.channelId);
+          const messages = await channel.messages.fetch({ limit: 50 });
+          const botMessages = messages.filter(m => m.author.id === client.user.id);
+          for (const msg of botMessages.values()) await msg.delete().catch(() => {});
+        } catch {}
+        return interaction.reply("🛑 **Draft has been CLOSED and RESET**\nBot messages cleared.");
       }
     }
 
