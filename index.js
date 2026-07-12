@@ -30,7 +30,8 @@ function freshData() {
     seasonTeams: [],
     pendingTrade: null,
     pickLog: [],
-    admins: []
+    admins: [],
+    year: null
   };
 }
 
@@ -39,10 +40,15 @@ function loadData(guildId) {
     const d = JSON.parse(fs.readFileSync(`./data_${guildId}.json`));
     if (!d.pendingTrade) d.pendingTrade = null;
     if (!d.admins) d.admins = d.players.length ? [d.players[0]] : [];
+    if (!d.year) d.year = null;
     return d;
   } catch {
     return freshData();
   }
+}
+
+function getYear(data) {
+  return data.year || new Date().getFullYear();
 }
 
 function saveData(data, guildId) {
@@ -66,7 +72,12 @@ async function safeFetch(url, options = {}) {
 }
 
 const TBA = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
-const CURRENT_YEAR = new Date().getFullYear();
+const DEFAULT_YEAR = new Date().getFullYear();
+const CURRENT_YEAR = DEFAULT_YEAR; // compat alias, will be phased out by per-guild year
+
+// Per-year cache for season teams
+let seasonTeamsCache = null;
+let seasonTeamsCacheYear = null;
 
 function erf(x) {
   const sign = x < 0 ? -1 : 1;
