@@ -76,7 +76,6 @@ const DEFAULT_YEAR = new Date().getFullYear();
 const CURRENT_YEAR = DEFAULT_YEAR; // compat alias, will be phased out by per-guild year
 
 // Per-year cache for season teams
-let seasonTeamsCache = null;
 let seasonTeamsCacheYear = null;
 
 function erf(x) {
@@ -107,24 +106,25 @@ async function getTeamName(teamNumber) {
   }
 }
 
-async function loadSeasonTeams() {
-  if (seasonTeamsCache) return seasonTeamsCache;
+async function loadSeasonTeams(year = DEFAULT_YEAR) {
+  if (seasonTeamsCacheYear === year && seasonTeamsCache) return seasonTeamsCache;
   const allTeams = [];
   let page = 0;
   while (true) {
-    const teams = await safeFetch(`https://www.thebluealliance.com/api/v3/teams/${CURRENT_YEAR}/${page}`, TBA);
+    const teams = await safeFetch(`https://www.thebluealliance.com/api/v3/teams/${year}/${page}`, TBA);
     if (!teams || teams.length === 0) break;
     allTeams.push(...teams.map(t => t.team_number));
     page++;
   }
   seasonTeamsCache = allTeams;
+  seasonTeamsCacheYear = year;
   return allTeams;
 }
 
-async function loadWorldsTeams() {
+async function loadWorldsTeams(year = DEFAULT_YEAR) {
   const [events, allTeams] = await Promise.all([
-    safeFetch(`https://www.thebluealliance.com/api/v3/events/${CURRENT_YEAR}`, TBA),
-    loadSeasonTeams()
+    safeFetch(`https://www.thebluealliance.com/api/v3/events/${year}`, TBA),
+    loadSeasonTeams(year)
   ]);
   const worlds = (events || [])
     .filter(e => e.event_type === 3 || e.event_type === 4)
@@ -157,8 +157,8 @@ function isAdmin(data, userId) {
 }
 
 // ---------------- SCORING ----------------
-async function getTeamSeasonScore(teamNumber) {
-  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${CURRENT_YEAR}`, TBA);
+async function getTeamSeasonScore(teamNumber, year = DEFAULT_YEAR) {
+  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${year}`, TBA);
   if (!events?.length) return 0;
 
   const regularEvents = events
@@ -178,8 +178,8 @@ async function getTeamSeasonScore(teamNumber) {
   return total;
 }
 
-async function getTeamWorldsScore(teamNumber) {
-  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${CURRENT_YEAR}`, TBA);
+async function getTeamWorldsScore(teamNumber, year = DEFAULT_YEAR) {
+  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${year}`, TBA);
   if (!events?.length) return 0;
 
   const worldsEvents = events.filter(e => e.event_type === 3 || e.event_type === 4);
@@ -287,8 +287,10 @@ async function doBotPick(data, guildId, channel) {
   const available = pool.filter(t => !drafted.has(t));
   if (!available.length) return;
 
-  // Score all available teams and pick the highest-scoring one
-  const scoreFn = data.phase === "worlds" ? getTeamWorldsScore : getTeamSeasonScore;
+  const year = getYear(data);
+  const scoreFn = data.phase === "worlds"
+    ? t => getTeamWorldsScore(t, year)
+    : t => getTeamSeasonScore(t, year);
   const scored = await Promise.all(available.map(async t => ({ team: t, score: await scoreFn(t) })));
   scored.sort((a, b) => b.score - a.score);
   const team = scored[0].team;
@@ -415,7 +417,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!isAdmin(data, userId)) return interaction.editReply("❌ Only an admin can start the draft.");
 
       data.phase = "season";
-      data.seasonTeams = await loadSeasonTeams();
+      data.seasonTeams = await loadSeasonTeams(getYear(data));
       data.draftOrder = [...data.players].sort(() => Math.random() - 0.5);
       data.currentPick = 0;
       data.teamsDrafted = Object.fromEntries(data.players.map(p => [p, []]));
@@ -443,10 +445,11 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.editReply("⏳ Calculating final season standings from TBA…");
 
-      const seasonStandings = await calcStandings(data, getTeamSeasonScore);
+      const year = getYear(data);
+      const seasonStandings = await calcStandings(data, t => getTeamSeasonScore(t, year));
       data.lastSeasonStandings = seasonStandings.map(p => p.player);
       data.phase = "worlds";
-      data.worldsTeams = await loadWorldsTeams();
+      data.worldsTeams = await loadWorldsTeams(getYear(data));
       data.draftOrder = [...data.lastSeasonStandings].reverse();
       data.currentPick = 0;
       data.teamsDrafted = Object.fromEntries(data.players.map(p => [p, []]));
@@ -617,7 +620,8 @@ client.on('interactionCreate', async (interaction) => {
       if (data.phase === "none") return interaction.editReply("The draft hasn't started yet.");
 
       const isWorlds = data.phase === "worlds" || data.phase === "worlds_finished";
-      const scoreFn  = isWorlds ? getTeamWorldsScore : getTeamSeasonScore;
+      const year = getYear(data);
+      const scoreFn  = isWorlds ? t => getTeamWorldsScore(t, year) : t => getTeamSeasonScore(t, year);
       const phaseLabel = isWorlds ? "Worlds" : "Season";
 
       const playerScores = await calcStandings(data, scoreFn);
@@ -644,7 +648,59 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── CURRENT YEAR ──────────────────────────────────────────────
     if (interaction.commandName === 'currentyear') {
-      return interaction.reply(`📅 The bot is currently using **${CURRENT_YEAR}** as the FRC season year.\nAll team lists, events, and scores are pulled from the ${CURRENT_YEAR} TBA database.`);
+      const y = getYear(data);
+      const src = data.year ? "overridden by admin" : "default (current calendar year)";
+      return interaction.reply(`📅 The bot is using **${y}** for TBA data (${src}).`);
+    }
+
+    if (interaction.commandName === 'setyear') {
+      if (!isAdmin(data, userId)) return interaction.reply({ content: "❌ Only admins can set the year.", ephemeral: true });
+      const y = interaction.options.getInteger('year');
+      data.year = y;
+      seasonTeamsCache = null;
+      seasonTeamsCacheYear = null;
+      saveData(data, guildId);
+      return interaction.reply(`📅 Year set to **${y}**. Team cache cleared — next draft will load ${y} teams from TBA.`);
+    }
+
+    if (interaction.commandName === 'skip') {
+      const current = getCurrentPlayer(data);
+      if (userId !== current && !isAdmin(data, userId)) return interaction.reply({ content: "⛔ It's not your turn (or you are not an admin).", ephemeral: true });
+      const pool = data.phase === "worlds" ? data.worldsTeams : data.seasonTeams;
+      const drafted = new Set(Object.values(data.teamsDrafted).flat());
+      const available = pool.filter(t => !drafted.has(t));
+      if (!available.length) return interaction.reply({ content: "❌ No teams left in the pool.", ephemeral: true });
+
+      await interaction.deferReply();
+      const year = getYear(data);
+      const scoreFn = data.phase === "worlds"
+        ? t => getTeamWorldsScore(t, year)
+        : t => getTeamSeasonScore(t, year);
+      const scored = await Promise.all(available.map(async t => ({ team: t, score: await scoreFn(t) })));
+      scored.sort((a, b) => b.score - a.score);
+      const team = scored[0].team;
+
+      data.teamsDrafted[current].push(team);
+      data.currentPick++;
+      data.pickLog.push({ player: current, team, pickIndex: data.currentPick - 1 });
+
+      const name = await getTeamName(team);
+      const maxPicks = data.players.length * 6;
+
+      if (data.currentPick >= maxPicks) {
+        data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
+        saveData(data, guildId);
+        return interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n🏁 **Draft complete!**`);
+      }
+
+      saveData(data, guildId);
+      const next = getCurrentPlayer(data);
+      await interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
+
+      if (next === BOT_PLAYER_ID) {
+        await doBotPick(data, guildId, interaction.channel);
+      }
+      return;
     }
 
     // ── SCORE BREAKDOWN ───────────────────────────────────────────
@@ -652,19 +708,20 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.deferReply();
       const teamNumber = interaction.options.getInteger('team');
 
+      const year = getYear(data);
       const [teamName, events] = await Promise.all([
         getTeamName(teamNumber),
-        safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${CURRENT_YEAR}`, TBA)
+        safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${year}`, TBA)
       ]);
 
-      if (!events?.length) return interaction.editReply(`No ${CURRENT_YEAR} events found for FRC ${teamNumber}.`);
+      if (!events?.length) return interaction.editReply(`No ${year} events found for FRC ${teamNumber}.`);
 
       const regularEvents = events
         .filter(e => e.event_type === 0 || e.event_type === 1)
         .sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
         .slice(0, 2);
 
-      if (!regularEvents.length) return interaction.editReply(`No regular season events found for **${teamName}** in ${CURRENT_YEAR}.`);
+      if (!regularEvents.length) return interaction.editReply(`No regular season events found for **${teamName}** in ${year}.`);
 
       const dpResults = await Promise.all(
         regularEvents.map(ev => safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/district_points`, TBA))
@@ -706,7 +763,8 @@ client.on('interactionCreate', async (interaction) => {
 
       if (!playerIds.length) return interaction.editReply("No matching fantasy player found.");
 
-      const scoreFn = data.phase === "worlds" || data.phase === "worlds_finished" ? getTeamWorldsScore : getTeamSeasonScore;
+      const year = getYear(data);
+      const scoreFn = data.phase === "worlds" || data.phase === "worlds_finished" ? t => getTeamWorldsScore(t, year) : t => getTeamSeasonScore(t, year);
       const blocks = await Promise.all(playerIds.map(async player => {
         const teams = data.teamsDrafted[player] || [];
         const teamLines = await Promise.all(teams.map(async team => {
@@ -754,7 +812,8 @@ client.on('interactionCreate', async (interaction) => {
       if (!data.players.length) return interaction.reply("No players in the draft yet.");
       await interaction.deferReply();
 
-      const scoreFn = data.phase === "worlds" || data.phase === "worlds_finished" ? getTeamWorldsScore : getTeamSeasonScore;
+      const year = getYear(data);
+      const scoreFn = data.phase === "worlds" || data.phase === "worlds_finished" ? t => getTeamWorldsScore(t, year) : t => getTeamSeasonScore(t, year);
       const medals = ['🥇', '🥈', '🥉'];
 
       const standings = await calcStandings(data, scoreFn);
@@ -798,8 +857,9 @@ client.on('interactionCreate', async (interaction) => {
 
       const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
       const buf = Buffer.from(csv, 'utf-8');
-      const att = new AttachmentBuilder(buf, { name: `fantasy_roster_${CURRENT_YEAR}.csv` });
-      return interaction.editReply({ content: `📄 Here is your ${CURRENT_YEAR} roster backup.`, files: [att] });
+      const y = getYear(data);
+      const att = new AttachmentBuilder(buf, { name: `fantasy_roster_${y}.csv` });
+      return interaction.editReply({ content: `📄 Here is your ${y} roster backup.`, files: [att] });
     }
 
     // ── ROSTER ────────────────────────────────────────────────────

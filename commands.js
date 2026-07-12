@@ -4,6 +4,11 @@ const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 const fullCommands = [
   new SlashCommandBuilder().setName('currentyear').setDescription('Show the current year the bot is using for TBA data'),
   new SlashCommandBuilder()
+    .setName('setyear')
+    .setDescription('Set the FRC season year for TBA data (admin only)')
+    .addIntegerOption(opt => opt.setName('year').setDescription('e.g. 2027').setRequired(true)),
+  new SlashCommandBuilder().setName('skip').setDescription('Auto-pick the highest-scoring available team for your turn'),
+  new SlashCommandBuilder()
     .setName('undraft')
     .setDescription('Undo the last pick or remove a specific team (admin only)')
     .addIntegerOption(opt => opt.setName('team').setDescription('FRC team number to undraft (omit to undo last pick)').setRequired(false)),
@@ -90,6 +95,7 @@ const closedCommands = [
     .addIntegerOption(opt => opt.setName('team').setDescription('FRC team number').setRequired(true)),
   new SlashCommandBuilder().setName('teams').setDescription('Show all fantasy teams and their owners'),
   new SlashCommandBuilder().setName('currentyear').setDescription('Show the current year the bot is using for TBA data'),
+  new SlashCommandBuilder().setName('skip').setDescription('Auto-pick the highest-scoring available team for your turn'),
   new SlashCommandBuilder().setName('exportcsv').setDescription('Export a CSV backup of all rosters'),
   new SlashCommandBuilder().setName('roster').setDescription('Show all rosters as a clean team list (no scores)'),
 ];
