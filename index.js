@@ -35,9 +35,9 @@ function freshData() {
   };
 }
 
-function loadData(guildId) {
+function loadData(channelId) {
   try {
-    const d = JSON.parse(fs.readFileSync(`./data_${guildId}.json`));
+    const d = JSON.parse(fs.readFileSync(`./data_${channelId}.json`));
     if (!d.pendingTrade) d.pendingTrade = null;
     if (!d.admins) d.admins = d.players.length ? [d.players[0]] : [];
     if (!d.year) d.year = null;
@@ -51,8 +51,8 @@ function getYear(data) {
   return data.year || new Date().getFullYear();
 }
 
-function saveData(data, guildId) {
-  fs.writeFileSync(`./data_${guildId}.json`, JSON.stringify(data, null, 2));
+function saveData(data, channelId) {
+  fs.writeFileSync(`./data_${channelId}.json`, JSON.stringify(data, null, 2));
 }
 
 // ---------------- TBA CACHE ----------------
@@ -278,7 +278,7 @@ async function buildFantasyBreakdown(data, scoreFn, player) {
 
 // ---------------- CPU AUTO-PICK ----------------
 // Called recursively until a human's turn or draft ends
-async function doBotPick(data, guildId, channel) {
+async function doBotPick(data, channelId, channel) {
   if (data.phase === "finished" || data.phase === "worlds_finished") return;
   if (getCurrentPlayer(data) !== BOT_PLAYER_ID) return;
 
@@ -303,19 +303,19 @@ async function doBotPick(data, guildId, channel) {
 
   if (data.currentPick >= maxPicks) {
     data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
-    saveData(data, guildId);
+    saveData(data, channelId);
     await channel.send(`🤖 **CPU** picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
     return;
   }
 
-  saveData(data, guildId);
+  saveData(data, channelId);
   const next = getCurrentPlayer(data);
   await channel.send(`🤖 **CPU** picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
   // If it's still the bot's turn (consecutive picks in snake), keep going
   if (next === BOT_PLAYER_ID) {
     await new Promise(r => setTimeout(r, 1500)); // small delay so it doesn't feel instant
-    await doBotPick(data, guildId, channel);
+    await doBotPick(data, channelId, channel);
   }
 }
 
@@ -335,7 +335,8 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.guildId) return interaction.reply({ content: "This bot only works inside a server.", ephemeral: true });
 
   const guildId = interaction.guildId;
-  const data = loadData(guildId);
+  const channelId = interaction.channelId;
+  const data = loadData(channelId);
   const userId = interaction.user.id;
 
   try {
@@ -351,12 +352,12 @@ client.on('interactionCreate', async (interaction) => {
       const { fullCommands, closedCommands } = require('./commands.js');
       if (setToOpen) {
         data.draftOpen = true;
-        saveData(data, guildId);
+        saveData(data, channelId);
         // Guild commands update instantly (vs global = up to 1 hour)
         await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId), { body: fullCommands });
         return interaction.reply("✅ **Draft is now OPEN**\nPlayers can now join using `/join_draft` or add a CPU with `/addbot`");
       } else {
-        saveData(freshData(), guildId);
+        saveData(freshData(), channelId);
         await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId), { body: closedCommands });
         // Bulk delete the bot's own recent messages in this channel
         try {
@@ -375,7 +376,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.players.includes(userId)) return interaction.reply("You are already in the draft.");
       data.players.push(userId);
       if (!data.admins.length) data.admins.push(userId);
-      saveData(data, guildId);
+      saveData(data, channelId);
       return interaction.reply(`✅ <@${userId}> has joined the draft!`);
     }
 
@@ -385,7 +386,7 @@ client.on('interactionCreate', async (interaction) => {
       const target = interaction.options.getUser('user');
       if (data.admins.includes(target.id)) return interaction.reply({ content: `${target} is already an admin.`, ephemeral: true });
       data.admins.push(target.id);
-      saveData(data, guildId);
+      saveData(data, channelId);
       return interaction.reply(`✅ ${target} has been promoted to **admin**.`);
     }
 
@@ -397,7 +398,7 @@ client.on('interactionCreate', async (interaction) => {
       const mId = `MANUAL_${rawName}`;
       if (data.players.includes(mId)) return interaction.reply({ content: `❌ A player named "${rawName}" is already in the draft.`, ephemeral: true });
       data.players.push(mId);
-      saveData(data, guildId);
+      saveData(data, channelId);
       return interaction.reply(`👤 **${rawName}** has been added as a manual player!`);
     }
 
@@ -406,7 +407,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!data.draftOpen) return interaction.reply("❌ Draft joining is currently closed.");
       if (data.players.includes(BOT_PLAYER_ID)) return interaction.reply("🤖 CPU is already in the draft.");
       data.players.push(BOT_PLAYER_ID);
-      saveData(data, guildId);
+      saveData(data, channelId);
       return interaction.reply("🤖 **CPU player added to the draft!** It will auto-pick randomly when it's its turn.");
     }
 
@@ -423,7 +424,7 @@ client.on('interactionCreate', async (interaction) => {
       data.teamsDrafted = Object.fromEntries(data.players.map(p => [p, []]));
       data.draftOpen = false;
       data.pendingTrade = null;
-      saveData(data, guildId);
+      saveData(data, channelId);
 
       const first = getCurrentPlayer(data);
       await interaction.editReply(
@@ -432,7 +433,7 @@ client.on('interactionCreate', async (interaction) => {
 
       // If CPU goes first, auto-pick immediately
       if (first === BOT_PLAYER_ID) {
-        await doBotPick(data, guildId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel);
       }
       return;
     }
@@ -455,7 +456,7 @@ client.on('interactionCreate', async (interaction) => {
       data.teamsDrafted = Object.fromEntries(data.players.map(p => [p, []]));
       data.draftOpen = false;
       data.pendingTrade = null;
-      saveData(data, guildId);
+      saveData(data, channelId);
 
       const medals = ['🥇', '🥈', '🥉'];
       const standingsText = seasonStandings
@@ -467,7 +468,7 @@ client.on('interactionCreate', async (interaction) => {
       );
 
       if (getCurrentPlayer(data) === BOT_PLAYER_ID) {
-        await doBotPick(data, guildId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel);
       }
       return;
     }
@@ -496,17 +497,17 @@ client.on('interactionCreate', async (interaction) => {
       const actor = actingAdmin ? `<@${userId}> → ${playerDisplay(pickerId)}` : `<@${userId}>`;
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
-        saveData(data, guildId);
+        saveData(data, channelId);
         return interaction.editReply(`✅ ${actor} picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
       }
 
-      saveData(data, guildId);
+      saveData(data, channelId);
       const next = getCurrentPlayer(data);
       await interaction.editReply(`✅ ${actor} picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
       // Trigger CPU auto-pick if it's now the bot's turn
       if (next === BOT_PLAYER_ID) {
-        await doBotPick(data, guildId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel);
       }
       return;
     }
@@ -536,16 +537,16 @@ client.on('interactionCreate', async (interaction) => {
 
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
-        saveData(data, guildId);
+        saveData(data, channelId);
         return interaction.editReply(`✅ ${playerDisplay(current)} picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
       }
 
-      saveData(data, guildId);
+      saveData(data, channelId);
       const next = getCurrentPlayer(data);
       await interaction.editReply(`✅ ${playerDisplay(current)} picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
       if (next === BOT_PLAYER_ID) {
-        await doBotPick(data, guildId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel);
       }
       return;
     }
@@ -568,7 +569,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.pendingTrade) return interaction.reply({ content: "❌ There's already a pending trade. It must be accepted, declined, or cancelled first.", ephemeral: true });
 
       data.pendingTrade = { from: userId, offering, wanting, to: theirOwner };
-      saveData(data, guildId);
+      saveData(data, channelId);
 
       const [offerName, wantName] = await Promise.all([getTeamName(offering), getTeamName(wanting)]);
       return interaction.reply({ embeds: [
@@ -595,7 +596,7 @@ client.on('interactionCreate', async (interaction) => {
       data.teamsDrafted[trade.from].push(trade.wanting);
       data.teamsDrafted[trade.to].push(trade.offering);
       data.pendingTrade = null;
-      saveData(data, guildId);
+      saveData(data, channelId);
 
       const [offerName, wantName] = await Promise.all([getTeamName(trade.offering), getTeamName(trade.wanting)]);
       return interaction.reply(
@@ -609,7 +610,7 @@ client.on('interactionCreate', async (interaction) => {
       if (!trade) return interaction.reply({ content: "❌ There's no pending trade.", ephemeral: true });
       if (userId !== trade.to && userId !== trade.from) return interaction.reply({ content: "❌ You're not part of this trade.", ephemeral: true });
       data.pendingTrade = null;
-      saveData(data, guildId);
+      saveData(data, channelId);
       return interaction.reply("❌ Trade cancelled.");
     }
 
@@ -659,7 +660,7 @@ client.on('interactionCreate', async (interaction) => {
       data.year = y;
       seasonTeamsCache = null;
       seasonTeamsCacheYear = null;
-      saveData(data, guildId);
+      saveData(data, channelId);
       return interaction.reply(`📅 Year set to **${y}**. Team cache cleared — next draft will load ${y} teams from TBA.`);
     }
 
@@ -689,16 +690,16 @@ client.on('interactionCreate', async (interaction) => {
 
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
-        saveData(data, guildId);
+        saveData(data, channelId);
         return interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n🏁 **Draft complete!**`);
       }
 
-      saveData(data, guildId);
+      saveData(data, channelId);
       const next = getCurrentPlayer(data);
       await interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
       if (next === BOT_PLAYER_ID) {
-        await doBotPick(data, guildId, interaction.channel);
+        await doBotPick(data, channelId, interaction.channel);
       }
       return;
     }
@@ -800,7 +801,7 @@ client.on('interactionCreate', async (interaction) => {
       data.currentPick = entry.pickIndex;
       if (data.phase === "finished") data.phase = data.seasonTeams.length ? "season" : "worlds";
       if (data.phase === "worlds_finished") data.phase = "worlds";
-      saveData(data, guildId);
+      saveData(data, channelId);
 
       const name = await getTeamName(entry.team);
       const current = getCurrentPlayer(data);
@@ -922,7 +923,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'reset_draft') {
       if (interaction.options.getString('confirm') !== "RESET") return interaction.reply("Type `RESET` to confirm.");
       if (!isAdmin(data, userId)) return interaction.reply("❌ Only an admin can reset.");
-      saveData(freshData(), guildId);
+      saveData(freshData(), channelId);
       return interaction.reply("🧹 Draft fully reset.");
     }
 
