@@ -93,6 +93,18 @@ const TBA = { headers: { 'X-TBA-Auth-Key': process.env.TBA_KEY } };
 const DEFAULT_YEAR = new Date().getFullYear();
 const CURRENT_YEAR = DEFAULT_YEAR; // compat alias, will be phased out by per-guild year
 
+// Permissions the bot needs to function correctly.
+// Used both for the permission check on guildCreate and to generate a correct invite link.
+const REQUIRED_PERMISSIONS = [
+  PermissionFlagsBits.ManageChannels,    // create #frc-fantasy-updates
+  PermissionFlagsBits.ManageRoles,       // set read-only permission overwrite on that channel
+  PermissionFlagsBits.ViewChannel,       // see channels
+  PermissionFlagsBits.SendMessages,      // post announcements / standings / alerts
+  PermissionFlagsBits.EmbedLinks,        // send rich embeds
+  PermissionFlagsBits.AttachFiles,       // send /exportcsv files
+  PermissionFlagsBits.ReadMessageHistory,// fetch the prediction message to edit it in place
+];
+
 // Per-year cache for season teams
 let seasonTeamsCacheYear = null;
 
@@ -679,10 +691,53 @@ client.once('clientReady', () => {
 });
 
 // ---------------- GUILD JOIN — create announcements channel ----------------
+
+// Human-readable names for the permission flags used in DM alerts.
+const PERMISSION_NAMES = {
+  [PermissionFlagsBits.ManageChannels]:     'Manage Channels',
+  [PermissionFlagsBits.ManageRoles]:        'Manage Roles',
+  [PermissionFlagsBits.ViewChannel]:        'View Channels',
+  [PermissionFlagsBits.SendMessages]:       'Send Messages',
+  [PermissionFlagsBits.EmbedLinks]:         'Embed Links',
+  [PermissionFlagsBits.AttachFiles]:        'Attach Files',
+  [PermissionFlagsBits.ReadMessageHistory]: 'Read Message History',
+};
+
 client.on('guildCreate', async (guild) => {
+  // ── 1. Permission check ────────────────────────────────────────────────────
+  // Determine which required permissions the bot is missing in this guild.
+  const botMember = guild.members.me;
+  const missingPerms = botMember
+    ? REQUIRED_PERMISSIONS.filter(p => !botMember.permissions.has(p))
+    : REQUIRED_PERMISSIONS; // can't resolve member — assume everything is missing
+
+  if (missingPerms.length) {
+    const missingList = missingPerms
+      .map(p => `• **${PERMISSION_NAMES[p] ?? String(p)}**`)
+      .join('\n');
+
+    const inviteLink = client.generateInvite({
+      scopes: ['bot', 'applications.commands'],
+      permissions: REQUIRED_PERMISSIONS,
+    });
+
+    const dmBody =
+      `⚠️ **FRC Fantasy Bot — Missing Permissions in "${guild.name}"**\n\n` +
+      `The bot is missing the following permissions, which will prevent some features from working:\n\n` +
+      `${missingList}\n\n` +
+      `Please kick the bot and re-invite it using this link to grant all required permissions:\n` +
+      `<${inviteLink}>`;
+
+    const owner = await guild.fetchOwner().catch(() => null);
+    if (owner) await owner.send(dmBody).catch(() => {}); // DM may be blocked — fail silently
+    console.warn(`guildCreate: missing permissions in ${guild.name} (${guild.id}): ${missingPerms.join(', ')}`);
+    // Don't return — still attempt setup with whatever permissions we do have.
+  }
+
+  // ── 2. Channel creation ────────────────────────────────────────────────────
   try {
     const config = loadGuildConfig(guild.id);
-    if (config.announcementChannelId) return; // already set up
+    if (config.announcementChannelId) return; // already set up from a previous join
 
     const channel = await guild.channels.create({
       name: 'frc-fantasy-updates',
@@ -710,7 +765,22 @@ client.on('guildCreate', async (guild) => {
       'A server admin should run `/setchannel` in whichever channel you want to use for draft commands.'
     );
   } catch (err) {
-    console.error('guildCreate error:', err);
+    console.error('guildCreate channel setup error:', err);
+
+    // If channel creation failed, DM the owner so they know setup is incomplete.
+    const owner = await guild.fetchOwner().catch(() => null);
+    if (owner) {
+      const inviteLink = client.generateInvite({
+        scopes: ['bot', 'applications.commands'],
+        permissions: REQUIRED_PERMISSIONS,
+      });
+      await owner.send(
+        `⚠️ **FRC Fantasy Bot — Setup Failed in "${guild.name}"**\n\n` +
+        `The bot couldn't create the \`#frc-fantasy-updates\` announcements channel. ` +
+        `This is usually a permissions issue.\n\n` +
+        `Please kick the bot and re-invite it using this link:\n<${inviteLink}>`
+      ).catch(() => {});
+    }
   }
 });
 
