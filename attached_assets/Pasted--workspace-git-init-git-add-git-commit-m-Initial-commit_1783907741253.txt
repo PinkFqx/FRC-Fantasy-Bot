@@ -1,0 +1,45 @@
+~/workspace$ git init
+git add .
+git commit -m "Initial commit - FRC Fantasy Draft Bot"
+git branch -M main
+git remote add origin https://github.com/Us3rnam31/FRC-Fantasy-Bot.git
+git push -u origin main
+Reinitialized existing Git repository in /home/runner/workspace/.git/
+On branch main
+nothing to commit, working tree clean
+error: remote origin already exists.
+Enumerating objects: 138, done.
+Counting objects: 100% (138/138), done.
+Delta compression using up to 2 threads
+Compressing objects: 100% (136/136), done.
+Writing objects: 100% (138/138), 69.12 KiB | 6.91 MiB/s, done.
+Total 138 (delta 90), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (90/90), done.
+remote: This repository moved. Please use the new location:
+remote:   https://github.com/Us3rnam31/FRC-Fantasy-Bot.git
+remote: error: GH013: Repository rule violations found for refs/heads/main.
+remote: 
+remote: - GITHUB PUSH PROTECTION
+remote:   —————————————————————————————————————————
+remote:     Resolve the following violations before pushing again
+remote: 
+remote:     - Push cannot contain secrets
+remote: 
+remote:     
+remote:      (?) Learn how to resolve a blocked push
+remote:      https://docs.github.com/code-security/secret-scanning/working-with-secret-scanning-and-push-protection/working-with-push-protection-from-the-command-line#resolving-a-blocked-push
+remote:     
+remote:     
+remote:       —— Discord Bot Token —————————————————————————————————
+remote:        locations:
+remote:          - commit: 6bea29f8b819281c69a145b0e8c8f5d675a1d6ad
+remote:            path: attached_assets/_1776821524877.env:1
+remote:     
+remote:        (?) To push, remove secret from commit(s) or follow this URL to allow the secret.
+remote:        https://github.com/Us3rnam31/FRC-Fantasy-Bot/security/secret-scanning/unblock-secret/3GQdSSCdFGIOA73d8CTCeniu62C
+remote:     
+remote: 
+remote: 
+To https://github.com/Us3rnam31/frc-draft-bot
+ ! [remote rejected] main -> main (push declined due to repository rule violations)
+error: failed to push some refs to 'https://github.com/Us3rnam31/frc-draft-bot'
