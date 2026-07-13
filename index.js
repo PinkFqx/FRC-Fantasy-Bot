@@ -63,9 +63,10 @@ function loadGuildConfig(guildId) {
   try {
     const cfg = JSON.parse(fs.readFileSync(`./guild_config_${guildId}.json`));
     if (!('predictionMessageId' in cfg)) cfg.predictionMessageId = null;
+    if (!('pickTimerMinutes'    in cfg)) cfg.pickTimerMinutes    = 0;
     return cfg;
   } catch {
-    return { draftChannelId: null, announcementChannelId: null, lastPostedWeek: -1, predictionMessageId: null };
+    return { draftChannelId: null, announcementChannelId: null, lastPostedWeek: -1, predictionMessageId: null, pickTimerMinutes: 0 };
   }
 }
 
@@ -610,6 +611,82 @@ async function checkAndPostPredictions() {
   }
 }
 
+// ---------------- PICK TIMER ----------------
+// Maps guildId → active timeout handle. Started after every human pick;
+// fires performAutoSkip if the player doesn't act in time.
+const pickTimers = new Map();
+
+function clearPickTimer(guildId) {
+  const handle = pickTimers.get(guildId);
+  if (handle) { clearTimeout(handle); pickTimers.delete(guildId); }
+}
+
+function startPickTimer(guildId, channelId) {
+  clearPickTimer(guildId);
+  const config = loadGuildConfig(guildId);
+  if (!config.pickTimerMinutes || config.pickTimerMinutes <= 0) return;
+  const ms = config.pickTimerMinutes * 60 * 1000;
+  const handle = setTimeout(() => {
+    performAutoSkip(guildId, channelId).catch(err =>
+      console.error(`Auto-skip error guild=${guildId}:`, err)
+    );
+  }, ms);
+  pickTimers.set(guildId, handle);
+}
+
+// Runs when the pick timer fires: auto-picks the best available team for the
+// current player, announces it, then starts the timer for the next player.
+async function performAutoSkip(guildId, channelId) {
+  const data = loadData(channelId);
+  if (!data.players.length || data.phase === 'none' ||
+      data.phase === 'finished' || data.phase === 'worlds_finished') return;
+
+  const current = getCurrentPlayer(data);
+  if (current === BOT_PLAYER_ID) return; // bot never needs auto-skipping
+
+  const pool = data.phase === 'worlds' ? data.worldsTeams : data.seasonTeams;
+  const drafted = new Set(Object.values(data.teamsDrafted).flat());
+  const available = pool.filter(t => !drafted.has(t));
+  if (!available.length) return;
+
+  const year = getYear(data);
+  const scoreFn = data.phase === 'worlds'
+    ? t => getTeamWorldsScore(t, year)
+    : t => getTeamSeasonScore(t, year);
+  const scored = await Promise.all(available.map(async t => ({ team: t, score: await scoreFn(t) })));
+  scored.sort((a, b) => b.score - a.score);
+  const team = scored[0].team;
+
+  data.teamsDrafted[current].push(team);
+  data.currentPick++;
+  data.pickLog.push({ player: current, team, pickIndex: data.currentPick - 1 });
+
+  const name = await getTeamName(team);
+  const maxPicks = data.players.length * 6;
+  const ch = await client.channels.fetch(channelId).catch(() => null);
+  if (!ch) { saveData(data, channelId); return; }
+
+  if (data.currentPick >= maxPicks) {
+    data.phase = data.phase === 'worlds' ? 'worlds_finished' : 'finished';
+    saveData(data, channelId);
+    clearPickTimer(guildId);
+    if (data.phase === 'finished') postRosterAnnouncement(data, guildId).catch(() => {});
+    await ch.send(`⏱️ **Time's up!** ${playerDisplay(current)} was auto-skipped → picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results.`);
+    return;
+  }
+
+  saveData(data, channelId);
+  const next = getCurrentPlayer(data);
+  await ch.send(`⏱️ **Time's up!** ${playerDisplay(current)} was auto-skipped → picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
+
+  if (next === BOT_PLAYER_ID) {
+    clearPickTimer(guildId);
+    await doBotPick(data, channelId, ch, guildId);
+  } else {
+    startPickTimer(guildId, channelId);
+  }
+}
+
 // ---------------- DRAFT HELPERS ----------------
 function getCurrentPlayer(data) {
   const n = data.draftOrder.length;
@@ -677,6 +754,7 @@ async function doBotPick(data, channelId, channel, guildId) {
   if (data.currentPick >= maxPicks) {
     data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
     saveData(data, channelId);
+    clearPickTimer(guildId);
     await channel.send(`🤖 **CPU** picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
     if (data.phase === "finished" && guildId) postRosterAnnouncement(data, guildId).catch(() => {});
     return;
@@ -690,6 +768,8 @@ async function doBotPick(data, channelId, channel, guildId) {
   if (next === BOT_PLAYER_ID) {
     await new Promise(r => setTimeout(r, 1500)); // small delay so it doesn't feel instant
     await doBotPick(data, channelId, channel, guildId);
+  } else {
+    startPickTimer(guildId, channelId);
   }
 }
 
@@ -1001,6 +1081,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, channelId);
+        clearPickTimer(guildId);
         if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
         return interaction.editReply(`✅ ${actor} picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
       }
@@ -1009,9 +1090,11 @@ client.on('interactionCreate', async (interaction) => {
       const next = getCurrentPlayer(data);
       await interaction.editReply(`✅ ${actor} picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
-      // Trigger CPU auto-pick if it's now the bot's turn
       if (next === BOT_PLAYER_ID) {
+        clearPickTimer(guildId);
         await doBotPick(data, channelId, interaction.channel, guildId);
+      } else {
+        startPickTimer(guildId, channelId);
       }
       return;
     }
@@ -1042,6 +1125,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, channelId);
+        clearPickTimer(guildId);
         if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
         return interaction.editReply(`✅ ${playerDisplay(current)} picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
       }
@@ -1051,7 +1135,10 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`✅ ${playerDisplay(current)} picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
       if (next === BOT_PLAYER_ID) {
+        clearPickTimer(guildId);
         await doBotPick(data, channelId, interaction.channel, guildId);
+      } else {
+        startPickTimer(guildId, channelId);
       }
       return;
     }
@@ -1072,6 +1159,11 @@ client.on('interactionCreate', async (interaction) => {
       if (theirOwner === userId) return interaction.reply({ content: "❌ You already own that team.", ephemeral: true });
       if (theirOwner === BOT_PLAYER_ID) return interaction.reply({ content: "❌ You can't trade with the CPU.", ephemeral: true });
       if (data.pendingTrade) return interaction.reply({ content: "❌ There's already a pending trade. It must be accepted, declined, or cancelled first.", ephemeral: true });
+
+      // Trades are locked after Week 5 (0-indexed week 4) has concluded
+      if (guildConfig.lastPostedWeek >= 4) {
+        return interaction.reply({ content: "🔒 Trading is closed — the trade deadline passed after Week 5.", ephemeral: true });
+      }
 
       data.pendingTrade = { from: userId, offering, wanting, to: theirOwner };
       saveData(data, channelId);
@@ -1196,6 +1288,7 @@ client.on('interactionCreate', async (interaction) => {
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
         saveData(data, channelId);
+        clearPickTimer(guildId);
         if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
         return interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n🏁 **Draft complete!**`);
       }
@@ -1205,7 +1298,10 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.editReply(`⚡ ${playerDisplay(current)} skipped and picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
       if (next === BOT_PLAYER_ID) {
+        clearPickTimer(guildId);
         await doBotPick(data, channelId, interaction.channel, guildId);
+      } else {
+        startPickTimer(guildId, channelId);
       }
       return;
     }
@@ -1496,8 +1592,286 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'reset_draft') {
       if (interaction.options.getString('confirm') !== "RESET") return interaction.reply("Type `RESET` to confirm.");
       if (!isAdmin(data, userId)) return interaction.reply("❌ Only an admin can reset.");
+      clearPickTimer(guildId);
       saveData(freshData(), channelId);
       return interaction.reply("🧹 Draft fully reset.");
+    }
+
+    // ── SET PICK TIMER ────────────────────────────────────────────
+    if (interaction.commandName === 'settimer') {
+      if (!isAdmin(data, userId)) return interaction.reply({ content: "❌ Only admins can set the pick timer.", ephemeral: true });
+      const minutes = interaction.options.getInteger('minutes');
+      guildConfig.pickTimerMinutes = minutes;
+      saveGuildConfig(guildConfig, guildId);
+      if (minutes === 0) {
+        clearPickTimer(guildId);
+        return interaction.reply({ content: "⏱️ Pick timer **disabled**.", ephemeral: true });
+      }
+      return interaction.reply({ content: `⏱️ Pick timer set to **${minutes} minute${minutes === 1 ? '' : 's'}**. Players will be auto-skipped if they don't pick in time.`, ephemeral: true });
+    }
+
+    // ── DRAFT ORDER ───────────────────────────────────────────────
+    if (interaction.commandName === 'draftorder') {
+      if (!data.players.length) return interaction.reply({ content: "No players in the draft yet.", ephemeral: true });
+      if (data.phase === 'none') return interaction.reply({ content: "The draft hasn't started yet.", ephemeral: true });
+      if (data.phase === 'finished' || data.phase === 'worlds_finished') return interaction.reply({ content: "The draft is already complete.", ephemeral: true });
+
+      const count = Math.min(interaction.options.getInteger('picks') ?? 10, 20);
+      const n = data.draftOrder.length;
+      const maxPicks = data.players.length * 6;
+      const lines = [];
+
+      for (let i = 0; i < count; i++) {
+        const idx = data.currentPick + i;
+        if (idx >= maxPicks) break;
+        const round = Math.floor(idx / n);
+        const pos = idx % n;
+        const player = round % 2 === 0 ? data.draftOrder[pos] : data.draftOrder[n - 1 - pos];
+        const marker = i === 0 ? ' ← **now**' : '';
+        lines.push(`\`Pick ${idx + 1}\` — ${playerDisplay(player)}${marker}`);
+      }
+
+      const timerNote = guildConfig.pickTimerMinutes > 0
+        ? `\n⏱️ Auto-skip timer: **${guildConfig.pickTimerMinutes} min**`
+        : '';
+      return interaction.reply({ embeds: [
+        new EmbedBuilder()
+          .setTitle('📋 Upcoming Draft Order')
+          .setDescription((lines.join('\n') || '*No picks remaining.*') + timerNote)
+          .setColor(0x5865F2)
+          .setFooter({ text: `Snake draft • showing next ${lines.length} pick${lines.length === 1 ? '' : 's'}` })
+      ]});
+    }
+
+    // ── MY TEAMS ──────────────────────────────────────────────────
+    if (interaction.commandName === 'myteams') {
+      await interaction.deferReply({ ephemeral: true });
+      if (!data.players.includes(userId)) return interaction.editReply("❌ You're not in this draft.");
+      if (data.phase === 'none') return interaction.editReply("The draft hasn't started yet.");
+
+      const myTeams = data.teamsDrafted[userId] || [];
+      if (!myTeams.length) return interaction.editReply("You haven't drafted any teams yet.");
+
+      const isWorlds = data.phase === 'worlds' || data.phase === 'worlds_finished';
+      const year = getYear(data);
+      const scoreFn = isWorlds ? t => getTeamWorldsScore(t, year) : t => getTeamSeasonScore(t, year);
+
+      const breakdowns = await Promise.all(myTeams.map(async team => {
+        const [name, score, bd] = await Promise.all([
+          getTeamName(team),
+          scoreFn(team),
+          isWorlds ? Promise.resolve(null) : getTeamEventBreakdown(team, year)
+        ]);
+        return { team, name, score, bd };
+      }));
+
+      const myTotal = breakdowns.reduce((s, b) => s + b.score, 0);
+
+      const lines = breakdowns.map(({ team, name, score, bd }) => {
+        const doubled = bd?.doubled ? ' *(doubled)*' : '';
+        const evLines = bd?.events.map(e => `  → ${e.eventKey}: **${e.rawPoints ?? '?'} pts**`).join('\n') ?? '';
+        return `**FRC ${team} — ${name.split(' (')[0]}**\n${evLines ? evLines + '\n' : ''}  Total: **${score} pts**${doubled}`;
+      });
+
+      // Compute rank among all players
+      const allTotals = await Promise.all(data.players.map(async p => ({
+        player: p,
+        total: (await Promise.all((data.teamsDrafted[p] || []).map(scoreFn))).reduce((a, b) => a + b, 0)
+      })));
+      allTotals.sort((a, b) => b.total - a.total);
+      const rank = allTotals.findIndex(s => s.player === userId) + 1;
+
+      const desc = lines.join('\n\n');
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder()
+          .setTitle(`🏅 Your Teams — ${year}`)
+          .setDescription(desc.length > 4000 ? desc.slice(0, 3997) + '…' : desc)
+          .addFields({ name: 'Your Total', value: `**${myTotal} pts** — rank **${rank}** of ${data.players.length}` })
+          .setColor(0x00AE86)
+          .setFooter({ text: 'First 2 qualifying events only • doubled if only 1 event played' })
+      ]});
+    }
+
+    // ── SCHEDULE ──────────────────────────────────────────────────
+    if (interaction.commandName === 'schedule') {
+      await interaction.deferReply();
+      if (!data.players.length) return interaction.editReply("No players in the draft yet.");
+
+      const year = getYear(data);
+      const today = new Date();
+      const twoWeeks = new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000);
+      const todayStr = today.toISOString().split('T')[0];
+      const twoWeeksStr = twoWeeks.toISOString().split('T')[0];
+
+      const allEvents = await safeFetch(`https://www.thebluealliance.com/api/v3/events/${year}/simple`, TBA);
+      if (!allEvents) return interaction.editReply("❌ Couldn't reach The Blue Alliance right now. Try again shortly.");
+
+      const upcoming = allEvents.filter(e =>
+        (e.event_type === 0 || e.event_type === 1) &&
+        e.start_date > todayStr && e.start_date <= twoWeeksStr
+      );
+      if (!upcoming.length) return interaction.editReply("📅 No qualifying events starting in the next 2 weeks.");
+
+      const allDraftedTeams = [...new Set(Object.values(data.teamsDrafted).flat())];
+      const fields = [];
+
+      for (const ev of upcoming) {
+        const eventTeams = await safeFetch(`https://www.thebluealliance.com/api/v3/event/${ev.key}/teams/simple`, TBA);
+        if (!eventTeams) continue;
+        const eventTeamNums = new Set(eventTeams.map(t => t.team_number));
+        const draftedHere = allDraftedTeams.filter(t => eventTeamNums.has(t));
+        if (!draftedHere.length) continue;
+
+        const lines = await Promise.all(draftedHere.map(async teamNum => {
+          const name = await getTeamName(teamNum);
+          const owner = findOwner(data, teamNum);
+          const ownerLabel = owner === BOT_PLAYER_ID ? '🤖 CPU'
+            : owner?.startsWith('MANUAL_') ? `👤 ${owner.replace('MANUAL_', '')}`
+            : owner ? `<@${owner}>` : '—';
+          return `• FRC ${teamNum} — ${name.split(' (')[0]} (${ownerLabel})`;
+        }));
+
+        const weekLabel = `Week ${resolveEventWeek(ev) + 1}`;
+        let fieldValue = `📆 ${ev.start_date} → ${ev.end_date}\n${lines.join('\n')}`;
+        if (fieldValue.length > 1024) fieldValue = fieldValue.slice(0, 1020) + '\n…';
+        fields.push({ name: `📍 ${ev.name} (${weekLabel})`, value: fieldValue });
+      }
+
+      if (!fields.length) return interaction.editReply("📅 No drafted teams are competing in events over the next 2 weeks.");
+
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder()
+          .setTitle('📅 Upcoming Events — Next 2 Weeks')
+          .addFields(fields.slice(0, 25))
+          .setColor(0x3498DB)
+          .setFooter({ text: 'Qualifying events (Regionals & Districts) only' })
+          .setTimestamp()
+      ]});
+    }
+
+    // ── HELP ──────────────────────────────────────────────────────
+    if (interaction.commandName === 'help') {
+      return interaction.reply({ ephemeral: true, embeds: [
+        new EmbedBuilder()
+          .setTitle('📖 FRC Fantasy Bot — Command Reference')
+          .setColor(0x5865F2)
+          .addFields(
+            {
+              name: '🔧 Draft Setup',
+              value: [
+                '`/join_draft` — Join the fantasy draft',
+                '`/addbot` — Add a CPU auto-picker',
+                '`/addmanualplayer [name]` — Add a non-Discord player *(admin)*',
+                '`/draftstatus [open]` — Open or close the draft *(admin)*',
+                '`/setchannel` — Set this channel as the draft channel *(admin)*',
+                '`/setyear [year]` — Override the FRC season year *(admin)*',
+                '`/addadmin [@user]` — Promote a player to admin',
+              ].join('\n')
+            },
+            {
+              name: '🎯 During the Draft',
+              value: [
+                '`/pick [team]` — Pick a team on your turn',
+                '`/manualpick [player] [team]` — Pick for a manual player *(admin)*',
+                '`/skip` — Auto-pick the best available team for your turn',
+                '`/draftorder` — Show the upcoming pick order',
+                '`/settimer [minutes]` — Set auto-skip timer; `0` = disabled *(admin)*',
+                '`/undraft [team]` — Undo a pick *(admin)*',
+                '`/reset_draft` — Fully reset the draft *(admin)*',
+              ].join('\n')
+            },
+            {
+              name: '🏆 Season',
+              value: [
+                '`/standings` — Live fantasy standings with scores',
+                '`/myteams` — Your personal team scores *(private)*',
+                '`/schedule` — Upcoming events for all drafted teams',
+                '`/score [team]` — Full point breakdown for any FRC team',
+                '`/breakdown [player]` — Detailed breakdown for a player or ALL',
+                '`/podium` — Fantasy podium',
+              ].join('\n')
+            },
+            {
+              name: '🔄 Trades *(closes after Week 5)*',
+              value: [
+                '`/trade [offer] [request]` — Propose a team swap',
+                '`/accepttrade` — Accept a pending trade',
+                '`/declinetrade` — Decline or cancel a trade',
+              ].join('\n')
+            },
+            {
+              name: '🔍 Teams & Info',
+              value: [
+                '`/teams` — All fantasy teams and their owners',
+                '`/roster` — Clean roster list (no scores)',
+                '`/team [name]` — Search for a team by name',
+                '`/team_identify [number]` — Look up a team by number',
+                '`/rules` — Show scoring rules',
+                '`/currentyear` — Show the active FRC season year',
+              ].join('\n')
+            },
+            {
+              name: '📤 Export & Announcements',
+              value: [
+                '`/exportcsv` — Export draft data as two CSV files',
+                '`/announce [message]` — Post to #frc-fantasy-updates *(admin)*',
+              ].join('\n')
+            }
+          )
+      ]});
+    }
+
+    // ── RULES ─────────────────────────────────────────────────────
+    if (interaction.commandName === 'rules') {
+      return interaction.reply({ embeds: [
+        new EmbedBuilder()
+          .setTitle('📜 FRC Fantasy Scoring Rules')
+          .setColor(0xE67E22)
+          .addFields(
+            {
+              name: 'Which events count?',
+              value: [
+                '• **Regionals** (type 0) and **District events** (type 1) only',
+                '• Only the **first 2** qualifying events per team are scored',
+                '• **District Championships** (DCMP, type 2) are **excluded**',
+              ].join('\n')
+            },
+            {
+              name: 'How are points calculated?',
+              value: [
+                '• Points are pulled live from TBA district point totals',
+                '• If a team only competes at **1** qualifying event, their points are **doubled**',
+                '• The doubling is applied automatically',
+              ].join('\n')
+            },
+            {
+              name: 'Draft & Trades',
+              value: [
+                '• Each manager drafts **6 teams** in a snake order',
+                '• Worlds draft is separate with its own scoring',
+                '• Trades are open through **Week 5** and close automatically after it concludes',
+              ].join('\n')
+            }
+          )
+          .setFooter({ text: 'Scores update live from The Blue Alliance' })
+      ]});
+    }
+
+    // ── ANNOUNCE ──────────────────────────────────────────────────
+    if (interaction.commandName === 'announce') {
+      if (!isAdmin(data, userId)) return interaction.reply({ content: "❌ Only admins can post announcements.", ephemeral: true });
+      const message = interaction.options.getString('message');
+      if (!guildConfig.announcementChannelId) return interaction.reply({ content: "❌ No announcements channel is configured. Re-invite the bot or check that `#frc-fantasy-updates` exists.", ephemeral: true });
+      const annChannel = await client.channels.fetch(guildConfig.announcementChannelId).catch(() => null);
+      if (!annChannel) return interaction.reply({ content: "❌ Couldn't find the announcements channel.", ephemeral: true });
+      await annChannel.send({ embeds: [
+        new EmbedBuilder()
+          .setDescription(message)
+          .setColor(0x5865F2)
+          .setFooter({ text: `Posted by ${interaction.user.username}` })
+          .setTimestamp()
+      ]});
+      return interaction.reply({ content: "✅ Announcement posted.", ephemeral: true });
     }
 
   } catch (err) {

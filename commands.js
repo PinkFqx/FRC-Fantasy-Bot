@@ -85,6 +85,22 @@ const fullCommands = [
         .setDescription('true = open for joining | false = close and reset')
         .setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName('settimer')
+    .setDescription('Set the auto-skip timer for picks; 0 = disabled (admin only)')
+    .addIntegerOption(opt => opt.setName('minutes').setDescription('Minutes before auto-skip; 0 to disable').setRequired(true).setMinValue(0)),
+  new SlashCommandBuilder()
+    .setName('draftorder')
+    .setDescription('Show the upcoming pick order in the snake draft')
+    .addIntegerOption(opt => opt.setName('picks').setDescription('Number of upcoming picks to show (default 10, max 20)').setRequired(false).setMinValue(1).setMaxValue(20)),
+  new SlashCommandBuilder().setName('myteams').setDescription('Show your personal team scores and breakdown (private)'),
+  new SlashCommandBuilder().setName('schedule').setDescription('Show upcoming events for all drafted teams in the next 2 weeks'),
+  new SlashCommandBuilder().setName('help').setDescription('Show a full command reference'),
+  new SlashCommandBuilder().setName('rules').setDescription('Show the fantasy scoring rules'),
+  new SlashCommandBuilder()
+    .setName('announce')
+    .setDescription('Post a custom message to #frc-fantasy-updates (admin only)')
+    .addStringOption(opt => opt.setName('message').setDescription('Message to post').setRequired(true).setMaxLength(2000)),
 ];
 
 const closedCommands = [
@@ -100,6 +116,18 @@ const closedCommands = [
   new SlashCommandBuilder().setName('skip').setDescription('Auto-pick the highest-scoring available team for your turn'),
   new SlashCommandBuilder().setName('exportcsv').setDescription('Export a CSV backup of all rosters'),
   new SlashCommandBuilder().setName('roster').setDescription('Show all rosters as a clean team list (no scores)'),
+  new SlashCommandBuilder()
+    .setName('settimer')
+    .setDescription('Set the auto-skip timer for picks; 0 = disabled (admin only)')
+    .addIntegerOption(opt => opt.setName('minutes').setDescription('Minutes before auto-skip; 0 to disable').setRequired(true).setMinValue(0)),
+  new SlashCommandBuilder().setName('myteams').setDescription('Show your personal team scores and breakdown (private)'),
+  new SlashCommandBuilder().setName('schedule').setDescription('Show upcoming events for all drafted teams in the next 2 weeks'),
+  new SlashCommandBuilder().setName('help').setDescription('Show a full command reference'),
+  new SlashCommandBuilder().setName('rules').setDescription('Show the fantasy scoring rules'),
+  new SlashCommandBuilder()
+    .setName('announce')
+    .setDescription('Post a custom message to #frc-fantasy-updates (admin only)')
+    .addStringOption(opt => opt.setName('message').setDescription('Message to post').setRequired(true).setMaxLength(2000)),
 ];
 
 const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
