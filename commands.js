@@ -47,6 +47,19 @@ const fullCommands = [
     .addIntegerOption(opt => opt.setName('offer').setDescription('Team number you are giving away').setRequired(true))
     .addIntegerOption(opt => opt.setName('request').setDescription('Team number you want in return').setRequired(true)),
   new SlashCommandBuilder()
+    .setName('tradelock')
+    .setDescription('Override the automatic trade lock rules (admin only)')
+    .addStringOption(opt =>
+      opt.setName('mode')
+        .setDescription('auto = default rules, locked = force closed, open = force allow')
+        .setRequired(true)
+        .addChoices(
+          { name: 'auto (default: Week 5 deadline + 24h after worlds)', value: 'auto' },
+          { name: 'locked (force trading closed)', value: 'locked' },
+          { name: 'open (force trading allowed)', value: 'open' }
+        )
+    ),
+  new SlashCommandBuilder()
     .setName('accepttrade')
     .setDescription('Accept the trade proposed to you'),
   new SlashCommandBuilder()

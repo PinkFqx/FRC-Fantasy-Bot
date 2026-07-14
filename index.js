@@ -34,7 +34,8 @@ function freshData() {
     pendingTrade: null,
     pickLog: [],
     admins: [],
-    year: null
+    year: null,
+    worldsFinishedAt: null
   };
 }
 
@@ -44,6 +45,7 @@ function loadData(channelId) {
     if (!d.pendingTrade) d.pendingTrade = null;
     if (!d.admins) d.admins = d.players.length ? [d.players[0]] : [];
     if (!d.year) d.year = null;
+    if (!('worldsFinishedAt' in d)) d.worldsFinishedAt = null;
     return d;
   } catch {
     return freshData();
@@ -64,9 +66,10 @@ function loadGuildConfig(guildId) {
     const cfg = JSON.parse(fs.readFileSync(`./guild_config_${guildId}.json`));
     if (!('predictionMessageId' in cfg)) cfg.predictionMessageId = null;
     if (!('pickTimerMinutes'    in cfg)) cfg.pickTimerMinutes    = 0;
+    if (!('tradeLockOverride'   in cfg)) cfg.tradeLockOverride   = null; // null = auto rules, true = force locked, false = force open
     return cfg;
   } catch {
-    return { draftChannelId: null, announcementChannelId: null, lastPostedWeek: -1, predictionMessageId: null, pickTimerMinutes: 0 };
+    return { draftChannelId: null, announcementChannelId: null, lastPostedWeek: -1, predictionMessageId: null, pickTimerMinutes: 0, tradeLockOverride: null };
   }
 }
 
@@ -612,7 +615,7 @@ function ensureRecoveredPlayer(state, id) {
 // Parses one of the bot's own past messages into a mutation against `state` (a
 // freshData()-shaped object being rebuilt from scratch). Returns 'reset' if the message
 // marks a draft close/reset, so the caller can discard everything accumulated so far.
-function applyRecoveredMessage(state, content) {
+function applyRecoveredMessage(state, content, timestamp) {
   if (/^🛑 \*\*Draft has been CLOSED and RESET\*\*/.test(content) || /^🧹 Draft fully reset\.$/.test(content)) {
     return 'reset';
   }
@@ -720,6 +723,15 @@ function applyRecoveredMessage(state, content) {
       if (state.draftOrder.length < state.players.length && !state.draftOrder.includes(player)) {
         state.draftOrder.push(player);
       }
+      // The completion messages append "🏁 Draft complete!" to the last pick of a phase.
+      if (/🏁 \*\*Draft complete!\*\*/.test(content)) {
+        if (state.phase === 'worlds') {
+          state.phase = 'worlds_finished';
+          state.worldsFinishedAt = timestamp ?? Date.now();
+        } else if (state.phase === 'season') {
+          state.phase = 'finished';
+        }
+      }
     }
   }
 }
@@ -756,7 +768,7 @@ async function rebuildDataFromChannelHistory(channelId) {
 
   let state = freshData();
   for (const msg of collected) {
-    const result = applyRecoveredMessage(state, msg.content);
+    const result = applyRecoveredMessage(state, msg.content, msg.createdTimestamp);
     if (result === 'reset') state = freshData();
   }
 
@@ -925,9 +937,20 @@ async function checkAndPostPredictions() {
 }
 
 // ---------------- PICK TIMER ----------------
-// Maps guildId → active timeout handle. Started after every human pick;
-// fires performAutoSkip if the player doesn't act in time.
+// Maps guildId → active timeout handle (whichever stage is currently pending).
+// Two-stage flow, started after every human pick:
+//   1. Main timer (settimer minutes) expires → ping the player + start a grace period.
+//   2. Grace period expires with no pick → auto-pick for them and move on.
+// Grace period = 10 minutes, or half the main timer if it's 25 minutes or less.
 const pickTimers = new Map();
+
+function graceMinutesFor(mainMinutes) {
+  return mainMinutes <= 25 ? mainMinutes / 2 : 10;
+}
+
+function formatMinutes(mins) {
+  return Number.isInteger(mins) ? String(mins) : mins.toFixed(1);
+}
 
 function clearPickTimer(guildId) {
   const handle = pickTimers.get(guildId);
@@ -940,14 +963,42 @@ function startPickTimer(guildId, channelId) {
   if (!config.pickTimerMinutes || config.pickTimerMinutes <= 0) return;
   const ms = config.pickTimerMinutes * 60 * 1000;
   const handle = setTimeout(() => {
-    performAutoSkip(guildId, channelId).catch(err =>
-      console.error(`Auto-skip error guild=${guildId}:`, err)
+    firePickTimerWarning(guildId, channelId, config.pickTimerMinutes).catch(err =>
+      console.error(`Pick timer warning error guild=${guildId}:`, err)
     );
   }, ms);
   pickTimers.set(guildId, handle);
 }
 
-// Runs when the pick timer fires: auto-picks the best available team for the
+// Runs when the main pick timer expires: pings the current player and gives them
+// one more grace period before actually auto-picking for them.
+async function firePickTimerWarning(guildId, channelId, mainMinutes) {
+  const data = loadData(channelId);
+  if (!data.players.length || data.phase === 'none' ||
+      data.phase === 'finished' || data.phase === 'worlds_finished') return;
+
+  const current = getCurrentPlayer(data);
+  if (current === BOT_PLAYER_ID) return; // bot never needs auto-skipping
+
+  const ch = await client.channels.fetch(channelId).catch(() => null);
+  const graceMinutes = graceMinutesFor(mainMinutes);
+
+  if (ch) {
+    await ch.send(
+      `⏰ ${playerDisplay(current)}, your pick timer expired!\n` +
+      `You have **${formatMinutes(graceMinutes)} more minute${graceMinutes === 1 ? '' : 's'}** to pick before you're auto-skipped.`
+    ).catch(() => {});
+  }
+
+  const handle = setTimeout(() => {
+    performAutoSkip(guildId, channelId).catch(err =>
+      console.error(`Auto-skip error guild=${guildId}:`, err)
+    );
+  }, graceMinutes * 60 * 1000);
+  pickTimers.set(guildId, handle);
+}
+
+// Runs when the grace period expires: auto-picks the best available team for the
 // current player, announces it, then starts the timer for the next player.
 async function performAutoSkip(guildId, channelId) {
   const data = loadData(channelId);
@@ -980,16 +1031,17 @@ async function performAutoSkip(guildId, channelId) {
 
   if (data.currentPick >= maxPicks) {
     data.phase = data.phase === 'worlds' ? 'worlds_finished' : 'finished';
+    if (data.phase === 'worlds_finished') data.worldsFinishedAt = Date.now();
     saveData(data, channelId);
     clearPickTimer(guildId);
     if (data.phase === 'finished') postRosterAnnouncement(data, guildId).catch(() => {});
-    await ch.send(`⏱️ **Time's up!** ${playerDisplay(current)} was auto-skipped → picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results.`);
+    await ch.send(`⏱️ **Grace period expired.** ${playerDisplay(current)} was auto-picked → **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results.`);
     return;
   }
 
   saveData(data, channelId);
   const next = getCurrentPlayer(data);
-  await ch.send(`⏱️ **Time's up!** ${playerDisplay(current)} was auto-skipped → picked **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
+  await ch.send(`⏱️ **Grace period expired.** ${playerDisplay(current)} was auto-picked → **${name}**\n\n👉 Next pick: ${playerDisplay(next)}`);
 
   if (next === BOT_PLAYER_ID) {
     clearPickTimer(guildId);
@@ -1040,6 +1092,7 @@ async function doBotPick(data, channelId, channel, guildId) {
 
   if (data.currentPick >= maxPicks) {
     data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
+    if (data.phase === 'worlds_finished') data.worldsFinishedAt = Date.now();
     saveData(data, channelId);
     clearPickTimer(guildId);
     await channel.send(`🤖 **CPU** picked **${name}**\n\n🏁 **Draft complete!** Run \`/standings\` to see the results!`);
@@ -1371,6 +1424,7 @@ client.on('interactionCreate', async (interaction) => {
       const actor = actingAdmin ? `<@${userId}> → ${playerDisplay(pickerId)}` : `<@${userId}>`;
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
+        if (data.phase === 'worlds_finished') data.worldsFinishedAt = Date.now();
         saveData(data, channelId);
         clearPickTimer(guildId);
         if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
@@ -1415,6 +1469,7 @@ client.on('interactionCreate', async (interaction) => {
 
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
+        if (data.phase === 'worlds_finished') data.worldsFinishedAt = Date.now();
         saveData(data, channelId);
         clearPickTimer(guildId);
         if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
@@ -1450,11 +1505,20 @@ client.on('interactionCreate', async (interaction) => {
       if (theirOwner === userId) return interaction.reply({ content: "❌ You already own that team.", ephemeral: true });
       if (theirOwner === BOT_PLAYER_ID) return interaction.reply({ content: "❌ You can't trade with the CPU.", ephemeral: true });
       if (data.pendingTrade) return interaction.reply({ content: "❌ There's already a pending trade. It must be accepted, declined, or cancelled first.", ephemeral: true });
-      if (data.phase === "worlds_finished") return interaction.reply({ content: "❌ The draft is fully complete — trading is closed.", ephemeral: true });
 
-      // Trades are locked after Week 5 (0-indexed week 4) has concluded
-      if (guildConfig.lastPostedWeek >= 4) {
-        return interaction.reply({ content: "🔒 Trading is closed — the trade deadline passed after Week 5.", ephemeral: true });
+      // Trade lock: an admin override always wins; otherwise the default rules apply —
+      // locked after Week 5 concludes, and locked 24h after the worlds draft finishes.
+      const WORLDS_TRADE_GRACE_MS = 24 * 60 * 60 * 1000;
+      if (guildConfig.tradeLockOverride === true) {
+        return interaction.reply({ content: "🔒 Trading has been manually locked by an admin (`/tradelock`).", ephemeral: true });
+      }
+      if (guildConfig.tradeLockOverride !== false) {
+        if (guildConfig.lastPostedWeek >= 4) {
+          return interaction.reply({ content: "🔒 Trading is closed — the trade deadline passed after Week 5.", ephemeral: true });
+        }
+        if (data.phase === "worlds_finished" && data.worldsFinishedAt && (Date.now() - data.worldsFinishedAt) >= WORLDS_TRADE_GRACE_MS) {
+          return interaction.reply({ content: "🔒 Trading is closed — it's been more than 24 hours since the worlds draft finished.", ephemeral: true });
+        }
       }
 
       data.pendingTrade = { from: userId, offering, wanting, to: theirOwner };
@@ -1472,6 +1536,20 @@ client.on('interactionCreate', async (interaction) => {
           )
           .setColor(0xF0A500)
       ]});
+    }
+
+    // ── TRADE LOCK OVERRIDE ─────────────────────────────────────────
+    if (interaction.commandName === 'tradelock') {
+      if (!isAdmin(data, userId)) return interaction.reply({ content: "❌ Only admins can change the trade lock.", ephemeral: true });
+      const mode = interaction.options.getString('mode');
+      guildConfig.tradeLockOverride = mode === 'locked' ? true : mode === 'open' ? false : null;
+      saveGuildConfig(guildConfig, guildId);
+      const msg = mode === 'locked'
+        ? "🔒 Trading is now **manually locked**, regardless of week or draft phase."
+        : mode === 'open'
+        ? "🔓 Trading is now **manually forced open**, ignoring the Week 5 and post-worlds deadlines."
+        : "⚙️ Trade lock reset to **auto** — locked after Week 5, and 24h after the worlds draft finishes.";
+      return interaction.reply({ content: msg, ephemeral: true });
     }
 
     // ── ACCEPT TRADE ──────────────────────────────────────────────
@@ -1578,6 +1656,7 @@ client.on('interactionCreate', async (interaction) => {
 
       if (data.currentPick >= maxPicks) {
         data.phase = data.phase === "worlds" ? "worlds_finished" : "finished";
+        if (data.phase === 'worlds_finished') data.worldsFinishedAt = Date.now();
         saveData(data, channelId);
         clearPickTimer(guildId);
         if (data.phase === "finished") postRosterAnnouncement(data, guildId).catch(() => {});
@@ -1706,7 +1785,7 @@ client.on('interactionCreate', async (interaction) => {
       // "finished" only ever comes from the season draft completing (doBotPick/pick/skip/
       // manualpick/auto-skip only set it that way), so reopening it always means "season".
       if (data.phase === "finished") data.phase = "season";
-      if (data.phase === "worlds_finished") data.phase = "worlds";
+      if (data.phase === "worlds_finished") { data.phase = "worlds"; data.worldsFinishedAt = null; }
       saveData(data, channelId);
 
       const name = await getTeamName(entry.team);
@@ -1911,7 +1990,12 @@ client.on('interactionCreate', async (interaction) => {
         clearPickTimer(guildId);
         return interaction.reply({ content: "⏱️ Pick timer **disabled**.", ephemeral: true });
       }
-      return interaction.reply({ content: `⏱️ Pick timer set to **${minutes} minute${minutes === 1 ? '' : 's'}**. Players will be auto-skipped if they don't pick in time.`, ephemeral: true });
+      const grace = graceMinutesFor(minutes);
+      return interaction.reply({
+        content: `⏱️ Pick timer set to **${minutes} minute${minutes === 1 ? '' : 's'}**.\n` +
+          `If a player doesn't pick in time, they'll be pinged and get an extra **${formatMinutes(grace)} minute${grace === 1 ? '' : 's'}** grace period before being auto-picked.`,
+        ephemeral: true
+      });
     }
 
     // ── DRAFT ORDER ───────────────────────────────────────────────
@@ -1936,7 +2020,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const timerNote = guildConfig.pickTimerMinutes > 0
-        ? `\n⏱️ Auto-skip timer: **${guildConfig.pickTimerMinutes} min**`
+        ? `\n⏱️ Auto-skip timer: **${guildConfig.pickTimerMinutes} min** (+ **${formatMinutes(graceMinutesFor(guildConfig.pickTimerMinutes))} min** grace period)`
         : '';
       return interaction.reply({ embeds: [
         new EmbedBuilder()
@@ -2085,6 +2169,7 @@ client.on('interactionCreate', async (interaction) => {
                 '`/undraft [team]` — Undo a pick *(admin)*',
                 '`/reset_draft` — Fully reset the draft *(admin)*',
                 '*CPU auto-picks and auto-skips pick from a pool of similarly-strong available teams, not always the single best one.*',
+                '*If the pick timer expires, the player is pinged and gets a grace period (10 min, or half the timer if it\'s 25 min or less) before being auto-picked.*',
               ].join('\n')
             },
             {
@@ -2099,9 +2184,10 @@ client.on('interactionCreate', async (interaction) => {
               ].join('\n')
             },
             {
-              name: '🔄 Trades *(closes after Week 5, and once the worlds draft is complete)*',
+              name: '🔄 Trades *(closes after Week 5, and 24h after the worlds draft finishes)*',
               value: [
                 '`/trade [offer] [request]` — Propose a team swap',
+                '`/tradelock [mode]` — Override the trade lock: `auto`, `locked`, or `open` *(admin)*',
                 '`/accepttrade` — Accept a pending trade',
                 '`/declinetrade` — Decline or cancel a trade',
               ].join('\n')
@@ -2157,6 +2243,8 @@ client.on('interactionCreate', async (interaction) => {
                 '• Each manager drafts **6 teams** in a snake order',
                 '• Worlds draft is separate with its own scoring',
                 '• Trades are open through **Week 5** and close automatically after it concludes',
+                '• Trades also close **24 hours** after the worlds draft finishes',
+                '• Admins can override the trade lock with `/tradelock`',
               ].join('\n')
             }
           )
