@@ -21,17 +21,22 @@ async function main() {
   const nonZero = scored.filter(s => s.score > 0).length;
   console.log(`Teams with a nonzero historical score: ${nonZero}/${scored.length}\n`);
 
-  console.log('Running the auto-pick selection 10 times against this scored pool:\n');
+  console.log('Simulating 10 sequential auto-picks (each pick removes that team from the pool,');
+  console.log('so the pool of candidates regenerates from what is actually still available):\n');
+
+  let remaining = [...scored]; // mirrors doBotPick's `available` shrinking as teams get drafted
   const picks = [];
   for (let i = 1; i <= 10; i++) {
-    const winner = bot.pickWithRandomness(scored, 10);
+    const winner = bot.pickWithRandomness(remaining, 10);
     const name = await bot.getTeamName(winner.team).catch(() => `Team ${winner.team}`);
     picks.push(winner.team);
-    console.log(`  Run ${i}: picked ${name} — score ${winner.score.toFixed(1)}`);
+    remaining = remaining.filter(s => s.team !== winner.team); // this team can never be picked again
+    console.log(`  Pick ${i}: ${name} — score ${winner.score.toFixed(1)}  (${remaining.length} teams left in sample pool)`);
   }
 
   const uniquePicks = new Set(picks).size;
-  console.log(`\n${uniquePicks} unique team(s) picked across 10 runs (out of a top-10 pool) — confirms randomness is spreading picks rather than always taking the single best team.`);
+  console.log(`\n${uniquePicks}/10 unique teams picked — each pick permanently removes that team, so the` +
+    ` next pool of ~10 candidates is always drawn from the best of what's still actually available.`);
 }
 
 main().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
