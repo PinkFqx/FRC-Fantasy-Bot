@@ -78,6 +78,11 @@ function saveGuildConfig(config, guildId) {
 const teamNameCache = new Map();
 let seasonTeamsCache = null;
 
+// Caches for auto-pick historical scoring, so repeated evaluations across
+// consecutive picks (same pool minus drafted teams) don't re-hit TBA.
+const districtPointsCache = new Map();  // eventKey -> points payload (or null)
+const historicalScoreCache = new Map(); // `${team}-${year}` -> averaged score
+
 async function safeFetch(url, options = {}) {
   try {
     const res = await fetch(url, options);
@@ -255,6 +260,75 @@ async function getTeamWorldsScore(teamNumber, year = DEFAULT_YEAR) {
     }
   }
   return total;
+}
+
+// Cached district-points fetch, shared across teams that competed at the same event.
+async function getDistrictPointsCached(eventKey) {
+  if (districtPointsCache.has(eventKey)) return districtPointsCache.get(eventKey);
+  const dp = await safeFetch(`https://www.thebluealliance.com/api/v3/event/${eventKey}/district_points`, TBA);
+  districtPointsCache.set(eventKey, dp);
+  return dp;
+}
+
+// A team's "best-2-events" score for a single year: first 2 qualifying (Regional/District,
+// type 0/1) events by date, points doubled if the team only played 1 that year.
+// Returns null if the team didn't compete in any qualifying event that year (so callers
+// can exclude that year from an average rather than treating it as a real 0).
+async function getTeamYearBestTwoScore(teamNumber, year) {
+  const events = await safeFetch(`https://www.thebluealliance.com/api/v3/team/frc${teamNumber}/events/${year}`, TBA);
+  if (!events?.length) return null;
+
+  const regularEvents = events
+    .filter(e => e.event_type === 0 || e.event_type === 1)
+    .sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
+    .slice(0, 2);
+  if (!regularEvents.length) return null;
+
+  let total = 0, counted = 0;
+  for (const ev of regularEvents) {
+    const dp = await getDistrictPointsCached(ev.key);
+    const pts = dp?.points?.[`frc${teamNumber}`]?.total;
+    if (pts != null) { total += pts; counted++; }
+  }
+  if (!counted) return null;
+  if (counted === 1) total *= 2;
+  return total;
+}
+
+// Auto-pick heuristic: averages each team's best-2-events score across the last few
+// seasons instead of just the current year. This normalizes teams that attend many
+// events (7 events, wins them all) against teams that attend few (2 events, wins them
+// all) but are actually comparable — looking at only their best 2 events per year keeps
+// the comparison fair, and averaging across years smooths out any single-season fluke.
+const HISTORICAL_YEARS_LOOKBACK = 3;
+async function getTeamHistoricalSeasonScore(teamNumber, currentYear) {
+  const years = [];
+  for (let i = 0; i < HISTORICAL_YEARS_LOOKBACK; i++) years.push(currentYear - i);
+
+  const yearScores = [];
+  for (const year of years) {
+    const cacheKey = `${teamNumber}-${year}`;
+    let score;
+    if (historicalScoreCache.has(cacheKey)) {
+      score = historicalScoreCache.get(cacheKey);
+    } else {
+      score = await getTeamYearBestTwoScore(teamNumber, year);
+      historicalScoreCache.set(cacheKey, score);
+    }
+    if (score != null) yearScores.push(score);
+  }
+
+  if (!yearScores.length) return 0;
+  return yearScores.reduce((a, b) => a + b, 0) / yearScores.length;
+}
+
+// Adds a randomness factor to auto-picks: instead of always taking the single
+// highest-scoring team, gather the top `poolSize` teams (a group that's "relatively
+// similar" in strength) and pick randomly among them.
+function pickWithRandomness(scoredList, poolSize = 10) {
+  const sorted = [...scoredList].sort((a, b) => b.score - a.score);
+  const candidates = sorted.slice(0, Math.min(poolSize, sorted.length));
+  return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
 async function calcStandings(data, scoreFn) {
@@ -652,10 +726,9 @@ async function performAutoSkip(guildId, channelId) {
   const year = getYear(data);
   const scoreFn = data.phase === 'worlds'
     ? t => getTeamWorldsScore(t, year)
-    : t => getTeamSeasonScore(t, year);
+    : t => getTeamHistoricalSeasonScore(t, year);
   const scored = await Promise.all(available.map(async t => ({ team: t, score: await scoreFn(t) })));
-  scored.sort((a, b) => b.score - a.score);
-  const team = scored[0].team;
+  const team = pickWithRandomness(scored).team;
 
   data.teamsDrafted[current].push(team);
   data.currentPick++;
@@ -740,10 +813,9 @@ async function doBotPick(data, channelId, channel, guildId) {
   const year = getYear(data);
   const scoreFn = data.phase === "worlds"
     ? t => getTeamWorldsScore(t, year)
-    : t => getTeamSeasonScore(t, year);
+    : t => getTeamHistoricalSeasonScore(t, year);
   const scored = await Promise.all(available.map(async t => ({ team: t, score: await scoreFn(t) })));
-  scored.sort((a, b) => b.score - a.score);
-  const team = scored[0].team;
+  const team = pickWithRandomness(scored).team;
   data.teamsDrafted[BOT_PLAYER_ID].push(team);
   data.currentPick++;
   data.pickLog.push({ player: BOT_PLAYER_ID, team, pickIndex: data.currentPick - 1 });
@@ -1273,10 +1345,9 @@ client.on('interactionCreate', async (interaction) => {
       const year = getYear(data);
       const scoreFn = data.phase === "worlds"
         ? t => getTeamWorldsScore(t, year)
-        : t => getTeamSeasonScore(t, year);
+        : t => getTeamHistoricalSeasonScore(t, year);
       const scored = await Promise.all(available.map(async t => ({ team: t, score: await scoreFn(t) })));
-      scored.sort((a, b) => b.score - a.score);
-      const team = scored[0].team;
+      const team = pickWithRandomness(scored).team;
 
       data.teamsDrafted[current].push(team);
       data.currentPick++;
